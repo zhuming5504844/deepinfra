@@ -34,3 +34,5 @@ pip install -r requirements.txt
 模型名称请使用 DeepInfra 版本（如 `openai/whisper-large-v3`）。如果只填写 `whisper-large-v3`，应用会自动补全为 `openai/whisper-large-v3`。
 
 应用会将输出保存到所选目录，`verbose_json` 会额外生成 `.srt` 字幕文件。
+
+如遇 402 错误，表示账户余额不足，请在 DeepInfra 控制台充值或配置自动续费。

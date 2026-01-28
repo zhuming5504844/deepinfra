@@ -305,9 +305,7 @@ class TranscriptionApp:
                         timeout=options.timeout_seconds,
                     )
                 if response.status_code >= 400:
-                    raise RuntimeError(
-                        f"API 返回错误 {response.status_code}: {response.text.strip()}"
-                    )
+                    raise RuntimeError(self._format_api_error(response))
 
                 if options.response_format in {"srt", "vtt"}:
                     with open(output_path, "w", encoding="utf-8") as output_file:
@@ -395,6 +393,21 @@ class TranscriptionApp:
             lines.append("")
 
         return "\n".join(lines)
+
+    def _format_api_error(self, response: requests.Response) -> str:
+        status = response.status_code
+        body = response.text.strip()
+        if status == 402:
+            return (
+                "API 返回错误 402: 账户余额不足，请在 DeepInfra 控制台充值或配置自动续费。"
+            )
+        if status == 401:
+            return "API 返回错误 401: API Key 无效或缺失。"
+        if status == 404:
+            return (
+                "API 返回错误 404: 模型不存在，请确认模型名称（如 openai/whisper-large-v3）。"
+            )
+        return f"API 返回错误 {status}: {body}"
 
     def _normalize_model(self, model: str) -> str:
         trimmed = model.strip()
