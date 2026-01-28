@@ -20,7 +20,8 @@ except ImportError:
     DND_FILES = None
 
 
-API_URL = "https://api.deepinfra.com/v1/openai/audio/transcriptions"
+DEFAULT_API_URL = "http://localhost:8000/v1/openai/audio/transcriptions"
+SETTINGS_FILENAME = ".deepinfra_transcriber.json"
 
 
 @dataclass
@@ -32,6 +33,7 @@ class Segment:
 
 @dataclass
 class TranscriptionOptions:
+    api_url: str
     api_key: str
     model: str
     language: str
@@ -52,8 +54,10 @@ class TranscriptionApp:
         self.root.title("DeepInfra 语音转录字幕")
         self.root.geometry("860x760")
         self.root.minsize(860, 760)
+        self.settings_path = os.path.join(os.path.expanduser("~"), SETTINGS_FILENAME)
 
         self._build_ui()
+        self._load_settings()
 
     def _build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=12)
@@ -79,12 +83,13 @@ class TranscriptionApp:
         grid = ttk.Frame(params_frame)
         grid.pack(fill=tk.X)
 
+        self.api_url_var = tk.StringVar(value=DEFAULT_API_URL)
         self.api_key_var = tk.StringVar()
         self.model_var = tk.StringVar(value="openai/whisper-large-v3")
-        self.language_var = tk.StringVar(value="zh")
+        self.language_var = tk.StringVar(value="en")
         self.prompt_var = tk.StringVar()
         self.temperature_var = tk.StringVar(value="0")
-        self.response_format_var = tk.StringVar(value="verbose_json")
+        self.response_format_var = tk.StringVar(value="srt")
         self.timestamp_var = tk.StringVar(value="segment")
         self.timeout_var = tk.StringVar(value="300")
         self.retries_var = tk.StringVar(value="2")
@@ -92,31 +97,32 @@ class TranscriptionApp:
         self.max_duration_var = tk.StringVar(value="8.0")
         self.max_silence_var = tk.StringVar(value="1.0")
 
-        self._add_row(grid, 0, "API Key", self.api_key_var, show="*")
-        self._add_row(grid, 1, "模型(model)", self.model_var)
-        self._add_row(grid, 2, "语言(language)", self.language_var)
-        self._add_row(grid, 3, "提示词(prompt)", self.prompt_var)
-        self._add_row(grid, 4, "温度(temperature)", self.temperature_var)
+        self._add_row(grid, 0, "API 地址(api_url)", self.api_url_var)
+        self._add_row(grid, 1, "API Key", self.api_key_var, show="*")
+        self._add_row(grid, 2, "模型(model)", self.model_var)
+        self._add_row(grid, 3, "语言(language)", self.language_var)
+        self._add_row(grid, 4, "提示词(prompt)", self.prompt_var)
+        self._add_row(grid, 5, "温度(temperature)", self.temperature_var)
 
         response_choices = ["text", "json", "srt", "vtt", "verbose_json"]
         response_box = ttk.Combobox(
             grid, textvariable=self.response_format_var, values=response_choices, width=18
         )
         response_box.state(["readonly"])
-        self._add_row(grid, 5, "返回格式(response_format)", widget=response_box)
+        self._add_row(grid, 6, "返回格式(response_format)", widget=response_box)
 
         self._add_row(
             grid,
-            6,
+            7,
             "时间粒度(timestamp_granularities)",
             self.timestamp_var,
             hint="逗号分隔: segment,word",
         )
-        self._add_row(grid, 7, "请求超时(秒)", self.timeout_var)
-        self._add_row(grid, 8, "重试次数", self.retries_var)
-        self._add_row(grid, 9, "每段最大字符数", self.max_chars_var)
-        self._add_row(grid, 10, "每段最长时间(秒)", self.max_duration_var)
-        self._add_row(grid, 11, "每段最长停顿(秒)", self.max_silence_var)
+        self._add_row(grid, 8, "请求超时(秒)", self.timeout_var)
+        self._add_row(grid, 9, "重试次数", self.retries_var)
+        self._add_row(grid, 10, "每段最大字符数", self.max_chars_var)
+        self._add_row(grid, 11, "每段最长时间(秒)", self.max_duration_var)
+        self._add_row(grid, 12, "每段最长停顿(秒)", self.max_silence_var)
 
         output_frame = ttk.LabelFrame(main, text="输出", padding=12)
         output_frame.pack(fill=tk.X, pady=(12, 0))
@@ -218,6 +224,7 @@ class TranscriptionApp:
         self.start_button.config(state=tk.DISABLED)
         self.progress.start(10)
         self._log("开始转录...")
+        self._save_settings()
 
         thread = threading.Thread(target=self._run_transcription, args=(options,), daemon=True)
         thread.start()
@@ -239,6 +246,7 @@ class TranscriptionApp:
         ]
 
         return TranscriptionOptions(
+            api_url=self.api_url_var.get().strip(),
             api_key=self.api_key_var.get().strip(),
             model=self.model_var.get().strip(),
             language=self.language_var.get().strip(),
@@ -270,6 +278,9 @@ class TranscriptionApp:
         output_dir = self.output_path_var.get() or os.path.dirname(audio_path)
         os.makedirs(output_dir, exist_ok=True)
 
+        if not options.api_url:
+            raise RuntimeError("API 地址不能为空，请填写本地或远程地址。")
+
         headers = {"Authorization": f"Bearer {options.api_key}"} if options.api_key else {}
 
         model_name = self._normalize_model(options.model)
@@ -298,7 +309,7 @@ class TranscriptionApp:
                     files = {"file": (os.path.basename(audio_path), audio_file)}
                     self._log("正在请求 API...")
                     response = requests.post(
-                        API_URL,
+                        options.api_url,
                         headers=headers,
                         data=payload,
                         files=files,
@@ -430,6 +441,57 @@ class TranscriptionApp:
         timestamp = time.strftime("%H:%M:%S")
         self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
         self.log_text.see(tk.END)
+
+    def _load_settings(self) -> None:
+        if not os.path.exists(self.settings_path):
+            return
+        try:
+            with open(self.settings_path, "r", encoding="utf-8") as settings_file:
+                data = json.load(settings_file)
+        except (json.JSONDecodeError, OSError):
+            self._log("提示: 参数配置文件读取失败，将使用默认值。")
+            return
+
+        self.api_url_var.set(data.get("api_url", self.api_url_var.get()))
+        self.api_key_var.set(data.get("api_key", self.api_key_var.get()))
+        self.model_var.set(data.get("model", self.model_var.get()))
+        self.language_var.set(data.get("language", self.language_var.get()))
+        self.prompt_var.set(data.get("prompt", self.prompt_var.get()))
+        self.temperature_var.set(data.get("temperature", self.temperature_var.get()))
+        self.response_format_var.set(
+            data.get("response_format", self.response_format_var.get())
+        )
+        self.timestamp_var.set(data.get("timestamp_granularities", self.timestamp_var.get()))
+        self.timeout_var.set(data.get("timeout_seconds", self.timeout_var.get()))
+        self.retries_var.set(data.get("max_retries", self.retries_var.get()))
+        self.max_chars_var.set(data.get("max_chars_per_segment", self.max_chars_var.get()))
+        self.max_duration_var.set(data.get("max_segment_duration", self.max_duration_var.get()))
+        self.max_silence_var.set(data.get("max_silence_duration", self.max_silence_var.get()))
+        self.output_path_var.set(data.get("output_dir", self.output_path_var.get()))
+
+    def _save_settings(self) -> None:
+        data = {
+            "api_url": self.api_url_var.get().strip(),
+            "api_key": self.api_key_var.get().strip(),
+            "model": self.model_var.get().strip(),
+            "language": self.language_var.get().strip(),
+            "prompt": self.prompt_var.get().strip(),
+            "temperature": self.temperature_var.get().strip(),
+            "response_format": self.response_format_var.get().strip(),
+            "timestamp_granularities": self.timestamp_var.get().strip(),
+            "timeout_seconds": self.timeout_var.get().strip(),
+            "max_retries": self.retries_var.get().strip(),
+            "max_chars_per_segment": self.max_chars_var.get().strip(),
+            "max_segment_duration": self.max_duration_var.get().strip(),
+            "max_silence_duration": self.max_silence_var.get().strip(),
+            "output_dir": self.output_path_var.get().strip(),
+        }
+        try:
+            with open(self.settings_path, "w", encoding="utf-8") as settings_file:
+                json.dump(data, settings_file, ensure_ascii=False, indent=2)
+            self._log(f"已保存参数配置: {self.settings_path}")
+        except OSError as exc:
+            self._log(f"参数保存失败: {exc}")
 
 
 def main() -> None:
