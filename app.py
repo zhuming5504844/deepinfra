@@ -21,9 +21,12 @@ except ImportError:
 
 
 DEFAULT_API_URL = "http://localhost:8000/v1/openai/audio/transcriptions"
+DEEPINFRA_OPENAI_URL = "https://api.deepinfra.com/v1/openai/audio/transcriptions"
+DEEPINFRA_INFERENCE_URL = "https://api.deepinfra.com/v1/inference/openai/whisper-large-v3"
 FALLBACK_API_URLS = [
     "http://localhost:8000/v1/openai/audio/transcriptions",
-    "https://api.deepinfra.com/v1/inference/openai/whisper-large-v3",
+    DEEPINFRA_OPENAI_URL,
+    DEEPINFRA_INFERENCE_URL,
 ]
 SETTINGS_FILENAME = ".deepinfra_transcriber.json"
 
@@ -288,6 +291,10 @@ class TranscriptionApp:
         if not options.api_url:
             raise RuntimeError("API 地址不能为空，请填写本地或远程地址。")
 
+        api_url = self._normalize_api_url(options.api_url)
+        if api_url != options.api_url:
+            self._log(f"API 地址已自动补全为: {api_url}")
+
         headers = {"Authorization": f"Bearer {options.api_key}"} if options.api_key else {}
 
         model_name = self._normalize_model(options.model)
@@ -316,7 +323,7 @@ class TranscriptionApp:
                     files = {"file": (os.path.basename(audio_path), audio_file)}
                     self._log("正在请求 API...")
                     response = requests.post(
-                        options.api_url,
+                        api_url,
                         headers=headers,
                         data=payload,
                         files=files,
@@ -346,6 +353,15 @@ class TranscriptionApp:
                 with open(output_path, "w", encoding="utf-8") as output_file:
                     output_file.write(response.text)
                 return output_path
+            except requests.exceptions.SSLError as exc:
+                if "/v1/inference" in api_url:
+                    self._log("检测到推理接口 TLS 异常，改用 OpenAI 兼容接口重试。")
+                    api_url = DEEPINFRA_OPENAI_URL
+                if attempt >= options.max_retries:
+                    raise exc
+                wait_time = 2 ** attempt
+                self._log(f"请求失败，{wait_time} 秒后重试: {exc}")
+                time.sleep(wait_time)
             except Exception as exc:  # noqa: BLE001
                 if attempt >= options.max_retries:
                     raise exc
@@ -433,6 +449,12 @@ class TranscriptionApp:
             return "openai/whisper-large-v3"
         if "/" not in trimmed:
             return f"openai/{trimmed}"
+        return trimmed
+
+    def _normalize_api_url(self, api_url: str) -> str:
+        trimmed = api_url.strip()
+        if trimmed.endswith("/v1/inference"):
+            return f"{trimmed}/openai/whisper-large-v3"
         return trimmed
 
     def _format_timestamp(self, seconds: float) -> str:

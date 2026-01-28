@@ -31,7 +31,9 @@ pip install -r requirements.txt
 默认使用本地 OpenAI 兼容接口：
 `http://localhost:8000/v1/openai/audio/transcriptions`
 
-也可选择 DeepInfra 远程接口（`https://api.deepinfra.com/v1/inference/openai/whisper-large-v3`）。
+也可选择 DeepInfra 远程接口：
+- OpenAI 兼容：`https://api.deepinfra.com/v1/openai/audio/transcriptions`
+- 推理接口：`https://api.deepinfra.com/v1/inference/openai/whisper-large-v3`
 
 模型名称请使用 OpenAI 兼容格式（如 `openai/whisper-large-v3`）。如果只填写 `whisper-large-v3`，应用会自动补全为 `openai/whisper-large-v3`。
 
