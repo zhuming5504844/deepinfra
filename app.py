@@ -21,6 +21,10 @@ except ImportError:
 
 
 DEFAULT_API_URL = "http://localhost:8000/v1/openai/audio/transcriptions"
+FALLBACK_API_URLS = [
+    "http://localhost:8000/v1/openai/audio/transcriptions",
+    "https://api.deepinfra.com/v1/inference/openai/whisper-large-v3",
+]
 SETTINGS_FILENAME = ".deepinfra_transcriber.json"
 
 
@@ -97,7 +101,10 @@ class TranscriptionApp:
         self.max_duration_var = tk.StringVar(value="8.0")
         self.max_silence_var = tk.StringVar(value="1.0")
 
-        self._add_row(grid, 0, "API 地址(api_url)", self.api_url_var)
+        api_url_box = ttk.Combobox(
+            grid, textvariable=self.api_url_var, values=FALLBACK_API_URLS, width=48
+        )
+        self._add_row(grid, 0, "API 地址(api_url)", widget=api_url_box)
         self._add_row(grid, 1, "API Key", self.api_key_var, show="*")
         self._add_row(grid, 2, "模型(model)", self.model_var)
         self._add_row(grid, 3, "语言(language)", self.language_var)
