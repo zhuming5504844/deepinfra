@@ -1,0 +1,5 @@
+requests>=2.31.0
+# Drag & Drop support for Tkinter
+# On Windows/macOS/Linux: pip install tkinterdnd2
+# (Tkinter itself ships with Python)
+tkinterdnd2>=0.3.0
