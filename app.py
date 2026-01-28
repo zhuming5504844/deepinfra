@@ -311,8 +311,15 @@ class TranscriptionApp:
                     raise RuntimeError(self._format_api_error(response))
 
                 if options.response_format in {"srt", "vtt"}:
+                    output_text = response.text
+                    if options.response_format == "srt":
+                        output_text = self._split_srt_text(
+                            output_text,
+                            options.max_chars_per_segment,
+                            options.max_segment_duration,
+                        )
                     with open(output_path, "w", encoding="utf-8") as output_file:
-                        output_file.write(response.text)
+                        output_file.write(output_text)
                     return output_path
 
                 if options.response_format == "verbose_json":
@@ -389,6 +396,37 @@ class TranscriptionApp:
         refined: List[Segment] = []
         for seg in merged:
             refined.extend(self._split_segment(seg, max_chars, max_duration))
+
+        srt = pysrt.SubRipFile()
+        for idx, seg in enumerate(refined, start=1):
+            srt.append(
+                pysrt.SubRipItem(
+                    index=idx,
+                    start=pysrt.SubRipTime(milliseconds=int(seg.start * 1000)),
+                    end=pysrt.SubRipTime(milliseconds=int(seg.end * 1000)),
+                    text=seg.text,
+                )
+            )
+
+        return srt.to_string()
+
+    def _split_srt_text(self, srt_text: str, max_chars: int, max_duration: float) -> str:
+        try:
+            items = pysrt.from_string(srt_text)
+        except Exception:  # noqa: BLE001
+            return srt_text
+
+        refined: List[Segment] = []
+        for item in items:
+            start_seconds = item.start.ordinal / 1000.0
+            end_seconds = item.end.ordinal / 1000.0
+            refined.extend(
+                self._split_segment(
+                    Segment(start=start_seconds, end=end_seconds, text=item.text),
+                    max_chars,
+                    max_duration,
+                )
+            )
 
         srt = pysrt.SubRipFile()
         for idx, seg in enumerate(refined, start=1):
