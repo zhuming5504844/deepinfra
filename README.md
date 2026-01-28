@@ -28,11 +28,17 @@ pip install -r requirements.txt
   ```
 
 ## 说明
-默认使用 DeepInfra OpenAI 兼容接口：
-`https://api.deepinfra.com/v1/openai/audio/transcriptions`
+默认使用本地 OpenAI 兼容接口：
+`http://localhost:8000/v1/openai/audio/transcriptions`
 
-模型名称请使用 DeepInfra 版本（如 `openai/whisper-large-v3`）。如果只填写 `whisper-large-v3`，应用会自动补全为 `openai/whisper-large-v3`。
+也可选择 DeepInfra 远程接口：
+- OpenAI 兼容：`https://api.deepinfra.com/v1/openai/audio/transcriptions`
+- 推理接口：`https://api.deepinfra.com/v1/inference/openai/whisper-large-v3`
+
+模型名称请使用 OpenAI 兼容格式（如 `openai/whisper-large-v3`）。如果只填写 `whisper-large-v3`，应用会自动补全为 `openai/whisper-large-v3`。
 
 应用会将输出保存到所选目录，`verbose_json` 会额外生成 `.srt` 字幕文件。
+
+应用会自动保存参数到用户目录下的 `.deepinfra_transcriber.json`，下次启动会自动恢复。
 
 如遇 402 错误，表示账户余额不足，请在 DeepInfra 控制台充值或配置自动续费。
