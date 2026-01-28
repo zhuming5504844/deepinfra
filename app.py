@@ -80,7 +80,7 @@ class TranscriptionApp:
         grid.pack(fill=tk.X)
 
         self.api_key_var = tk.StringVar()
-        self.model_var = tk.StringVar(value="whisper-large-v3")
+        self.model_var = tk.StringVar(value="openai/whisper-large-v3")
         self.language_var = tk.StringVar(value="zh")
         self.prompt_var = tk.StringVar()
         self.temperature_var = tk.StringVar(value="0")
@@ -272,8 +272,12 @@ class TranscriptionApp:
 
         headers = {"Authorization": f"Bearer {options.api_key}"} if options.api_key else {}
 
+        model_name = self._normalize_model(options.model)
+        if model_name != options.model:
+            self._log(f"模型已自动补全为: {model_name}")
+
         data = {
-            "model": options.model,
+            "model": model_name,
             "language": options.language or None,
             "prompt": options.prompt or None,
             "temperature": options.temperature,
@@ -391,6 +395,14 @@ class TranscriptionApp:
             lines.append("")
 
         return "\n".join(lines)
+
+    def _normalize_model(self, model: str) -> str:
+        trimmed = model.strip()
+        if not trimmed:
+            return "openai/whisper-large-v3"
+        if "/" not in trimmed:
+            return f"openai/{trimmed}"
+        return trimmed
 
     def _format_timestamp(self, seconds: float) -> str:
         delta = timedelta(seconds=seconds)

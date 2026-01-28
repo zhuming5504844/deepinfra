@@ -31,4 +31,6 @@ pip install -r requirements.txt
 默认使用 DeepInfra OpenAI 兼容接口：
 `https://api.deepinfra.com/v1/openai/audio/transcriptions`
 
+模型名称请使用 DeepInfra 版本（如 `openai/whisper-large-v3`）。如果只填写 `whisper-large-v3`，应用会自动补全为 `openai/whisper-large-v3`。
+
 应用会将输出保存到所选目录，`verbose_json` 会额外生成 `.srt` 字幕文件。
