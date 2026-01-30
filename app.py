@@ -1,5 +1,7 @@
 import json
+import math
 import os
+import textwrap
 import threading
 import time
 import tkinter as tk
@@ -9,6 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
 
 import requests
+import pysrt
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -308,8 +311,15 @@ class TranscriptionApp:
                     raise RuntimeError(self._format_api_error(response))
 
                 if options.response_format in {"srt", "vtt"}:
+                    output_text = response.text
+                    if options.response_format == "srt":
+                        output_text = self._split_srt_text(
+                            output_text,
+                            options.max_chars_per_segment,
+                            options.max_segment_duration,
+                        )
                     with open(output_path, "w", encoding="utf-8") as output_file:
-                        output_file.write(response.text)
+                        output_file.write(output_text)
                     return output_path
 
                 if options.response_format == "verbose_json":
@@ -383,16 +393,117 @@ class TranscriptionApp:
         if current:
             merged.append(current)
 
-        lines = []
-        for idx, seg in enumerate(merged, start=1):
-            start_time = self._format_timestamp(seg.start)
-            end_time = self._format_timestamp(seg.end)
-            lines.append(str(idx))
-            lines.append(f"{start_time} --> {end_time}")
-            lines.append(seg.text)
-            lines.append("")
+        refined: List[Segment] = []
+        for seg in merged:
+            refined.extend(self._split_segment(seg, max_chars, max_duration))
 
-        return "\n".join(lines)
+        srt = pysrt.SubRipFile()
+        for idx, seg in enumerate(refined, start=1):
+            srt.append(
+                pysrt.SubRipItem(
+                    index=idx,
+                    start=pysrt.SubRipTime(milliseconds=int(seg.start * 1000)),
+                    end=pysrt.SubRipTime(milliseconds=int(seg.end * 1000)),
+                    text=seg.text,
+                )
+            )
+
+        return srt.to_string()
+
+    def _split_srt_text(self, srt_text: str, max_chars: int, max_duration: float) -> str:
+        try:
+            items = pysrt.from_string(srt_text)
+        except Exception:  # noqa: BLE001
+            return srt_text
+
+        refined: List[Segment] = []
+        for item in items:
+            start_seconds = item.start.ordinal / 1000.0
+            end_seconds = item.end.ordinal / 1000.0
+            refined.extend(
+                self._split_segment(
+                    Segment(start=start_seconds, end=end_seconds, text=item.text),
+                    max_chars,
+                    max_duration,
+                )
+            )
+
+        srt = pysrt.SubRipFile()
+        for idx, seg in enumerate(refined, start=1):
+            srt.append(
+                pysrt.SubRipItem(
+                    index=idx,
+                    start=pysrt.SubRipTime(milliseconds=int(seg.start * 1000)),
+                    end=pysrt.SubRipTime(milliseconds=int(seg.end * 1000)),
+                    text=seg.text,
+                )
+            )
+
+        return srt.to_string()
+
+    def _split_segment(self, segment: Segment, max_chars: int, max_duration: float) -> List[Segment]:
+        text = segment.text.strip()
+        if not text:
+            return []
+
+        if max_chars <= 0:
+            chunks = [text]
+        else:
+            chunks = textwrap.wrap(
+                text,
+                width=max_chars,
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+
+        total_duration = max(segment.end - segment.start, 0.0)
+        if max_duration > 0 and total_duration > 0:
+            required_count = max(len(chunks), math.ceil(total_duration / max_duration))
+            if required_count > len(chunks):
+                target_width = max(1, math.ceil(len(text) / required_count))
+                if max_chars > 0:
+                    target_width = min(max_chars, target_width)
+                chunks = textwrap.wrap(
+                    text,
+                    width=target_width,
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                )
+            if len(chunks) < required_count:
+                chunks = self._ensure_chunk_count(chunks, required_count)
+
+        total_chars = sum(len(chunk) for chunk in chunks) or 1
+        current_start = segment.start
+        refined = []
+        for index, chunk in enumerate(chunks):
+            if index == len(chunks) - 1:
+                chunk_end = segment.end
+            else:
+                chunk_duration = total_duration * len(chunk) / total_chars
+                chunk_end = current_start + chunk_duration
+            refined.append(Segment(current_start, chunk_end, chunk))
+            current_start = chunk_end
+        return refined
+
+    def _ensure_chunk_count(self, chunks: List[str], target_count: int) -> List[str]:
+        normalized = [chunk.strip() for chunk in chunks if chunk.strip()]
+        while len(normalized) < target_count:
+            longest_index = max(range(len(normalized)), key=lambda i: len(normalized[i]))
+            text = normalized[longest_index]
+            if len(text) <= 1:
+                break
+            mid = len(text) // 2
+            split_index = text.rfind(" ", 0, mid)
+            if split_index == -1:
+                split_index = text.find(" ", mid)
+            if split_index == -1:
+                first, second = text[:mid], text[mid:]
+            else:
+                first, second = text[:split_index], text[split_index + 1 :]
+            normalized[longest_index : longest_index + 1] = [
+                part.strip() for part in (first, second) if part.strip()
+            ]
+        return normalized
 
     def _format_api_error(self, response: requests.Response) -> str:
         status = response.status_code
