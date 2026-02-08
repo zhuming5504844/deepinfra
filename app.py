@@ -6,12 +6,10 @@ import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass
-from datetime import timedelta
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
 
 import requests
-import pysrt
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -23,7 +21,13 @@ except ImportError:
     DND_FILES = None
 
 
-API_URL = "https://api.deepinfra.com/v1/openai/audio/transcriptions"
+API_URL = "https://api.deepinfra.com/v1/inference/openai/whisper-large-v3"
+DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_RETRIES = 2
+DEFAULT_MAX_CHARS_PER_SEGMENT = 20
+DEFAULT_MAX_SEGMENT_DURATION = 8.0
+DEFAULT_MAX_SILENCE_DURATION = 1.0
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".deepinfra_transcriber.json")
 
 
 @dataclass
@@ -36,17 +40,14 @@ class Segment:
 @dataclass
 class TranscriptionOptions:
     api_key: str
+    api_url: str
     model: str
-    language: str
-    prompt: str
-    temperature: float
-    response_format: str
-    timestamp_granularities: List[str]
-    timeout_seconds: int
-    max_retries: int
-    max_chars_per_segment: int
-    max_segment_duration: float
-    max_silence_duration: float
+    chunk_level: str
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    max_retries: int = DEFAULT_RETRIES
+    max_chars_per_segment: int = DEFAULT_MAX_CHARS_PER_SEGMENT
+    max_segment_duration: float = DEFAULT_MAX_SEGMENT_DURATION
+    max_silence_duration: float = DEFAULT_MAX_SILENCE_DURATION
 
 
 class TranscriptionApp:
@@ -57,6 +58,7 @@ class TranscriptionApp:
         self.root.minsize(860, 760)
 
         self._build_ui()
+        self._load_settings()
 
     def _build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=12)
@@ -76,50 +78,34 @@ class TranscriptionApp:
             drop_hint = ttk.Label(file_frame, text="(可拖放文件)", foreground="#666")
             drop_hint.pack(side=tk.LEFT, padx=(8, 0))
 
-        params_frame = ttk.LabelFrame(main, text="转录参数（全参数）", padding=12)
+        params_frame = ttk.LabelFrame(main, text="转录参数（必填项）", padding=12)
         params_frame.pack(fill=tk.X, pady=(12, 0))
 
         grid = ttk.Frame(params_frame)
         grid.pack(fill=tk.X)
 
         self.api_key_var = tk.StringVar()
+        self.api_url_var = tk.StringVar(value=API_URL)
         self.model_var = tk.StringVar(value="openai/whisper-large-v3")
-        self.language_var = tk.StringVar(value="zh")
-        self.prompt_var = tk.StringVar()
-        self.temperature_var = tk.StringVar(value="0")
-        self.response_format_var = tk.StringVar(value="verbose_json")
-        self.timestamp_var = tk.StringVar(value="segment")
-        self.timeout_var = tk.StringVar(value="300")
-        self.retries_var = tk.StringVar(value="2")
-        self.max_chars_var = tk.StringVar(value="20")
-        self.max_duration_var = tk.StringVar(value="8.0")
-        self.max_silence_var = tk.StringVar(value="1.0")
+        self.chunk_level_var = tk.StringVar(value="segment")
 
         self._add_row(grid, 0, "API Key", self.api_key_var, show="*")
-        self._add_row(grid, 1, "模型(model)", self.model_var)
-        self._add_row(grid, 2, "语言(language)", self.language_var)
-        self._add_row(grid, 3, "提示词(prompt)", self.prompt_var)
-        self._add_row(grid, 4, "温度(temperature)", self.temperature_var)
-
-        response_choices = ["text", "json", "srt", "vtt", "verbose_json"]
-        response_box = ttk.Combobox(
-            grid, textvariable=self.response_format_var, values=response_choices, width=18
-        )
-        response_box.state(["readonly"])
-        self._add_row(grid, 5, "返回格式(response_format)", widget=response_box)
-
-        self._add_row(
+        self._add_row(grid, 1, "API 地址", self.api_url_var)
+        model_box = ttk.Combobox(
             grid,
-            6,
-            "时间粒度(timestamp_granularities)",
-            self.timestamp_var,
-            hint="逗号分隔: segment,word",
+            textvariable=self.model_var,
+            values=["openai/whisper-large-v3", "openai/whisper-large-v2"],
         )
-        self._add_row(grid, 7, "请求超时(秒)", self.timeout_var)
-        self._add_row(grid, 8, "重试次数", self.retries_var)
-        self._add_row(grid, 9, "每段最大字符数", self.max_chars_var)
-        self._add_row(grid, 10, "每段最长时间(秒)", self.max_duration_var)
-        self._add_row(grid, 11, "每段最长停顿(秒)", self.max_silence_var)
+        self._add_row(grid, 2, "模型(model)", widget=model_box)
+
+        chunk_box = ttk.Combobox(
+            grid,
+            textvariable=self.chunk_level_var,
+            values=["segment", "word"],
+            width=18,
+        )
+        chunk_box.state(["readonly"])
+        self._add_row(grid, 3, "输出粒度", widget=chunk_box, hint="segment=段落, word=逐词")
 
         output_frame = ttk.LabelFrame(main, text="输出", padding=12)
         output_frame.pack(fill=tk.X, pady=(12, 0))
@@ -136,6 +122,9 @@ class TranscriptionApp:
 
         self.start_button = ttk.Button(action_frame, text="一键启动转录", command=self._start)
         self.start_button.pack(side=tk.LEFT)
+
+        save_btn = ttk.Button(action_frame, text="保存默认设置", command=self._save_settings)
+        save_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         self.progress = ttk.Progressbar(action_frame, mode="indeterminate")
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
@@ -206,6 +195,43 @@ class TranscriptionApp:
             self.output_path_var.set(path)
             self._log(f"输出目录: {path}")
 
+    def _settings_snapshot(self) -> dict:
+        return {
+            "api_key": self.api_key_var.get().strip(),
+            "api_url": self.api_url_var.get().strip(),
+            "model": self.model_var.get().strip(),
+            "chunk_level": self.chunk_level_var.get().strip(),
+            "output_dir": self.output_path_var.get().strip(),
+        }
+
+    def _apply_settings(self, settings: dict) -> None:
+        self.api_key_var.set(settings.get("api_key", self.api_key_var.get()))
+        self.api_url_var.set(settings.get("api_url", self.api_url_var.get()))
+        self.model_var.set(settings.get("model", self.model_var.get()))
+        self.chunk_level_var.set(settings.get("chunk_level", self.chunk_level_var.get()))
+        self.output_path_var.set(settings.get("output_dir", self.output_path_var.get()))
+
+    def _load_settings(self) -> None:
+        if not os.path.isfile(SETTINGS_PATH):
+            return
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as settings_file:
+                settings = json.load(settings_file)
+            if isinstance(settings, dict):
+                self._apply_settings(settings)
+                self._log("已加载默认设置。")
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"默认设置加载失败: {exc}")
+
+    def _save_settings(self) -> None:
+        settings = self._settings_snapshot()
+        try:
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as settings_file:
+                json.dump(settings, settings_file, ensure_ascii=False, indent=2)
+            self._log("已保存默认设置。")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("保存失败", f"无法保存默认设置: {exc}")
+
     def _start(self) -> None:
         if self.start_button["state"] == tk.DISABLED:
             return
@@ -226,34 +252,26 @@ class TranscriptionApp:
         thread.start()
 
     def _collect_options(self) -> Optional[TranscriptionOptions]:
-        try:
-            temperature = float(self.temperature_var.get())
-            timeout = int(self.timeout_var.get())
-            retries = int(self.retries_var.get())
-            max_chars = int(self.max_chars_var.get())
-            max_duration = float(self.max_duration_var.get())
-            max_silence = float(self.max_silence_var.get())
-        except ValueError:
-            messagebox.showerror("参数错误", "请检查数值参数格式是否正确。")
+        api_key = self.api_key_var.get().strip()
+        api_url = self.api_url_var.get().strip()
+        model = self.model_var.get().strip()
+        chunk_level = self.chunk_level_var.get().strip()
+
+        if not api_key:
+            messagebox.showwarning("缺少 API Key", "请输入 API Key。")
+            return None
+        if not api_url:
+            messagebox.showwarning("缺少 API 地址", "请输入 API 地址。")
+            return None
+        if not model:
+            messagebox.showwarning("缺少模型", "请输入或选择模型名称。")
             return None
 
-        timestamps = [
-            value.strip() for value in self.timestamp_var.get().split(",") if value.strip()
-        ]
-
         return TranscriptionOptions(
-            api_key=self.api_key_var.get().strip(),
-            model=self.model_var.get().strip(),
-            language=self.language_var.get().strip(),
-            prompt=self.prompt_var.get().strip(),
-            temperature=temperature,
-            response_format=self.response_format_var.get().strip(),
-            timestamp_granularities=timestamps,
-            timeout_seconds=timeout,
-            max_retries=retries,
-            max_chars_per_segment=max_chars,
-            max_segment_duration=max_duration,
-            max_silence_duration=max_silence,
+            api_key=api_key,
+            api_url=api_url,
+            model=model,
+            chunk_level=chunk_level or "segment",
         )
 
     def _run_transcription(self, options: TranscriptionOptions) -> None:
@@ -273,35 +291,31 @@ class TranscriptionApp:
         output_dir = self.output_path_var.get() or os.path.dirname(audio_path)
         os.makedirs(output_dir, exist_ok=True)
 
-        headers = {"Authorization": f"Bearer {options.api_key}"} if options.api_key else {}
+        headers = {"Authorization": f"Bearer {options.api_key}"}
 
         model_name = self._normalize_model(options.model)
         if model_name != options.model:
             self._log(f"模型已自动补全为: {model_name}")
 
         data = {
-            "model": model_name,
-            "language": options.language or None,
-            "prompt": options.prompt or None,
-            "temperature": options.temperature,
-            "response_format": options.response_format,
+            "task": "transcribe",
+            "chunk_level": options.chunk_level,
         }
-        if options.timestamp_granularities:
-            data["timestamp_granularities"] = json.dumps(options.timestamp_granularities)
 
         payload = {key: value for key, value in data.items() if value is not None}
 
         filename = os.path.splitext(os.path.basename(audio_path))[0]
-        output_extension = "srt" if options.response_format in {"srt", "vtt"} else "txt"
-        output_path = os.path.join(output_dir, f"{filename}.{output_extension}")
+        output_path = os.path.join(output_dir, f"{filename}.srt")
+
+        api_url = self._build_api_url(options.api_url, model_name)
 
         for attempt in range(options.max_retries + 1):
             try:
                 with open(audio_path, "rb") as audio_file:
-                    files = {"file": (os.path.basename(audio_path), audio_file)}
+                    files = {"audio": (os.path.basename(audio_path), audio_file)}
                     self._log("正在请求 API...")
                     response = requests.post(
-                        API_URL,
+                        api_url,
                         headers=headers,
                         data=payload,
                         files=files,
@@ -310,33 +324,16 @@ class TranscriptionApp:
                 if response.status_code >= 400:
                     raise RuntimeError(self._format_api_error(response))
 
-                if options.response_format in {"srt", "vtt"}:
-                    output_text = response.text
-                    if options.response_format == "srt":
-                        output_text = self._split_srt_text(
-                            output_text,
-                            options.max_chars_per_segment,
-                            options.max_segment_duration,
-                        )
-                    with open(output_path, "w", encoding="utf-8") as output_file:
-                        output_file.write(output_text)
-                    return output_path
-
-                if options.response_format == "verbose_json":
-                    result = response.json()
-                    srt = self._build_srt_from_segments(
-                        result.get("segments", []),
-                        options.max_chars_per_segment,
-                        options.max_segment_duration,
-                        options.max_silence_duration,
-                    )
-                    output_path = os.path.join(output_dir, f"{filename}.srt")
-                    with open(output_path, "w", encoding="utf-8") as output_file:
-                        output_file.write(srt)
-                    return output_path
-
+                result = self._extract_transcription_result(response.json())
+                srt = self._build_srt(
+                    result,
+                    options.chunk_level,
+                    options.max_chars_per_segment,
+                    options.max_segment_duration,
+                    options.max_silence_duration,
+                )
                 with open(output_path, "w", encoding="utf-8") as output_file:
-                    output_file.write(response.text)
+                    output_file.write(srt)
                 return output_path
             except Exception as exc:  # noqa: BLE001
                 if attempt >= options.max_retries:
@@ -346,6 +343,55 @@ class TranscriptionApp:
                 time.sleep(wait_time)
 
         raise RuntimeError("无法完成转录，请检查网络或 API Key。")
+
+    def _build_srt(
+        self,
+        result: dict,
+        chunk_level: str,
+        max_chars: int,
+        max_duration: float,
+        max_silence: float,
+    ) -> str:
+        if chunk_level == "word":
+            words = result.get("words", [])
+            if words:
+                return self._build_srt_from_words(words)
+        return self._build_srt_from_segments(
+            result.get("segments", []),
+            max_chars,
+            max_duration,
+            max_silence,
+        )
+
+    def _extract_transcription_result(self, payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            return {}
+        output = payload.get("output")
+        if isinstance(output, dict):
+            return output
+        if isinstance(output, list) and output:
+            first = output[0]
+            if isinstance(first, dict):
+                return first
+        return payload
+
+    def _build_srt_from_words(self, words_data: List[dict]) -> str:
+        srt_lines = []
+        for idx, word in enumerate(words_data, start=1):
+            text = (word.get("word") or "").strip()
+            if not text:
+                continue
+            start = float(word.get("start", 0.0))
+            end = float(word.get("end", start))
+            srt_lines.extend(
+                [
+                    str(idx),
+                    f"{self._format_timestamp(start)} --> {self._format_timestamp(end)}",
+                    text,
+                    "",
+                ]
+            )
+        return "\n".join(srt_lines).strip() + ("\n" if srt_lines else "")
 
     def _build_srt_from_segments(
         self,
@@ -397,49 +443,17 @@ class TranscriptionApp:
         for seg in merged:
             refined.extend(self._split_segment(seg, max_chars, max_duration))
 
-        srt = pysrt.SubRipFile()
+        srt_lines = []
         for idx, seg in enumerate(refined, start=1):
-            srt.append(
-                pysrt.SubRipItem(
-                    index=idx,
-                    start=pysrt.SubRipTime(milliseconds=int(seg.start * 1000)),
-                    end=pysrt.SubRipTime(milliseconds=int(seg.end * 1000)),
-                    text=seg.text,
-                )
+            srt_lines.extend(
+                [
+                    str(idx),
+                    f"{self._format_timestamp(seg.start)} --> {self._format_timestamp(seg.end)}",
+                    seg.text,
+                    "",
+                ]
             )
-
-        return srt.to_string()
-
-    def _split_srt_text(self, srt_text: str, max_chars: int, max_duration: float) -> str:
-        try:
-            items = pysrt.from_string(srt_text)
-        except Exception:  # noqa: BLE001
-            return srt_text
-
-        refined: List[Segment] = []
-        for item in items:
-            start_seconds = item.start.ordinal / 1000.0
-            end_seconds = item.end.ordinal / 1000.0
-            refined.extend(
-                self._split_segment(
-                    Segment(start=start_seconds, end=end_seconds, text=item.text),
-                    max_chars,
-                    max_duration,
-                )
-            )
-
-        srt = pysrt.SubRipFile()
-        for idx, seg in enumerate(refined, start=1):
-            srt.append(
-                pysrt.SubRipItem(
-                    index=idx,
-                    start=pysrt.SubRipTime(milliseconds=int(seg.start * 1000)),
-                    end=pysrt.SubRipTime(milliseconds=int(seg.end * 1000)),
-                    text=seg.text,
-                )
-            )
-
-        return srt.to_string()
+        return "\n".join(srt_lines).strip() + ("\n" if srt_lines else "")
 
     def _split_segment(self, segment: Segment, max_chars: int, max_duration: float) -> List[Segment]:
         text = segment.text.strip()
@@ -529,13 +543,27 @@ class TranscriptionApp:
         return trimmed
 
     def _format_timestamp(self, seconds: float) -> str:
-        delta = timedelta(seconds=seconds)
-        total_seconds = int(delta.total_seconds())
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        secs = total_seconds % 60
-        milliseconds = int((seconds - total_seconds) * 1000)
+        total_ms = max(int(seconds * 1000), 0)
+        hours = total_ms // 3_600_000
+        minutes = (total_ms % 3_600_000) // 60_000
+        secs = (total_ms % 60_000) // 1_000
+        milliseconds = total_ms % 1_000
         return f"{hours:02}:{minutes:02}:{secs:02},{milliseconds:03}"
+
+    def _build_api_url(self, api_url: str, model: str) -> str:
+        base = api_url.strip().rstrip("/")
+        if not base:
+            return API_URL
+
+        normalized_model = self._normalize_model(model)
+        if base.endswith(normalized_model):
+            return base
+        if base.endswith("/v1/inference"):
+            return f"{base}/{normalized_model}"
+        if "/v1/inference/" in base:
+            prefix = base.split("/v1/inference/")[0]
+            return f"{prefix}/v1/inference/{normalized_model}"
+        return base
 
     def _log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
