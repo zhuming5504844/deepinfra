@@ -2,26 +2,13 @@ import json
 import math
 import os
 import textwrap
-import threading
 import time
-import tkinter as tk
 from dataclasses import dataclass
-from datetime import timedelta
-from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
 
-import requests
 import pysrt
-
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-
-    DND_AVAILABLE = True
-except ImportError:
-    DND_AVAILABLE = False
-    TkinterDnD = tk.Tk
-    DND_FILES = None
-
+import requests
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 API_URL = "https://api.deepinfra.com/v1/openai/audio/transcriptions"
 
@@ -47,237 +34,34 @@ class TranscriptionOptions:
     max_chars_per_segment: int
     max_segment_duration: float
     max_silence_duration: float
+    audio_path: str
+    output_dir: str
 
 
-class TranscriptionApp:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("DeepInfra 语音转录字幕")
-        self.root.geometry("860x760")
-        self.root.minsize(860, 760)
+class TranscriptionWorker(QtCore.QObject):
+    log_message = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal(str)
+    failed = QtCore.pyqtSignal(str)
 
-        self._build_ui()
+    def __init__(self, options: TranscriptionOptions) -> None:
+        super().__init__()
+        self.options = options
 
-    def _build_ui(self) -> None:
-        main = ttk.Frame(self.root, padding=12)
-        main.pack(fill=tk.BOTH, expand=True)
-
-        file_frame = ttk.LabelFrame(main, text="音频文件", padding=12)
-        file_frame.pack(fill=tk.X)
-
-        self.audio_path_var = tk.StringVar()
-        audio_entry = ttk.Entry(file_frame, textvariable=self.audio_path_var)
-        audio_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        browse_btn = ttk.Button(file_frame, text="选择文件", command=self._choose_file)
-        browse_btn.pack(side=tk.LEFT, padx=(8, 0))
-
-        if DND_AVAILABLE:
-            drop_hint = ttk.Label(file_frame, text="(可拖放文件)", foreground="#666")
-            drop_hint.pack(side=tk.LEFT, padx=(8, 0))
-
-        params_frame = ttk.LabelFrame(main, text="转录参数（全参数）", padding=12)
-        params_frame.pack(fill=tk.X, pady=(12, 0))
-
-        grid = ttk.Frame(params_frame)
-        grid.pack(fill=tk.X)
-
-        self.api_key_var = tk.StringVar()
-        self.model_var = tk.StringVar(value="openai/whisper-large-v3")
-        self.language_var = tk.StringVar(value="zh")
-        self.prompt_var = tk.StringVar()
-        self.temperature_var = tk.StringVar(value="0")
-        self.response_format_var = tk.StringVar(value="verbose_json")
-        self.timestamp_var = tk.StringVar(value="segment")
-        self.timeout_var = tk.StringVar(value="300")
-        self.retries_var = tk.StringVar(value="2")
-        self.max_chars_var = tk.StringVar(value="20")
-        self.max_duration_var = tk.StringVar(value="8.0")
-        self.max_silence_var = tk.StringVar(value="1.0")
-
-        self._add_row(grid, 0, "API Key", self.api_key_var, show="*")
-        self._add_row(grid, 1, "模型(model)", self.model_var)
-        self._add_row(grid, 2, "语言(language)", self.language_var)
-        self._add_row(grid, 3, "提示词(prompt)", self.prompt_var)
-        self._add_row(grid, 4, "温度(temperature)", self.temperature_var)
-
-        response_choices = ["text", "json", "srt", "vtt", "verbose_json"]
-        response_box = ttk.Combobox(
-            grid, textvariable=self.response_format_var, values=response_choices, width=18
-        )
-        response_box.state(["readonly"])
-        self._add_row(grid, 5, "返回格式(response_format)", widget=response_box)
-
-        self._add_row(
-            grid,
-            6,
-            "时间粒度(timestamp_granularities)",
-            self.timestamp_var,
-            hint="逗号分隔: segment,word",
-        )
-        self._add_row(grid, 7, "请求超时(秒)", self.timeout_var)
-        self._add_row(grid, 8, "重试次数", self.retries_var)
-        self._add_row(grid, 9, "每段最大字符数", self.max_chars_var)
-        self._add_row(grid, 10, "每段最长时间(秒)", self.max_duration_var)
-        self._add_row(grid, 11, "每段最长停顿(秒)", self.max_silence_var)
-
-        output_frame = ttk.LabelFrame(main, text="输出", padding=12)
-        output_frame.pack(fill=tk.X, pady=(12, 0))
-
-        self.output_path_var = tk.StringVar()
-        output_entry = ttk.Entry(output_frame, textvariable=self.output_path_var)
-        output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        output_btn = ttk.Button(output_frame, text="选择输出目录", command=self._choose_output)
-        output_btn.pack(side=tk.LEFT, padx=(8, 0))
-
-        action_frame = ttk.Frame(main)
-        action_frame.pack(fill=tk.X, pady=(12, 0))
-
-        self.start_button = ttk.Button(action_frame, text="一键启动转录", command=self._start)
-        self.start_button.pack(side=tk.LEFT)
-
-        self.progress = ttk.Progressbar(action_frame, mode="indeterminate")
-        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
-
-        log_frame = ttk.LabelFrame(main, text="日志", padding=12)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
-
-        self.log_text = tk.Text(log_frame, height=14)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-
-        self._log("应用启动完成。")
-        if not DND_AVAILABLE:
-            self._log("提示: 未安装 tkinterdnd2，拖放功能不可用。")
-        else:
-            self._enable_drop()
-
-    def _add_row(
-        self,
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        variable: Optional[tk.StringVar] = None,
-        show: Optional[str] = None,
-        hint: Optional[str] = None,
-        widget: Optional[tk.Widget] = None,
-    ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, padx=(0, 8), pady=4)
-        if widget is None:
-            entry = ttk.Entry(parent, textvariable=variable, show=show)
-            entry.grid(row=row, column=1, sticky=tk.EW, pady=4)
-            widget = entry
-        else:
-            widget.grid(row=row, column=1, sticky=tk.W, pady=4)
-
-        if hint:
-            ttk.Label(parent, text=hint, foreground="#666").grid(
-                row=row, column=2, sticky=tk.W, padx=(8, 0), pady=4
-            )
-
-        parent.columnconfigure(1, weight=1)
-
-    def _enable_drop(self) -> None:
-        if not DND_AVAILABLE:
-            return
-
-        def handle_drop(event: tk.Event) -> None:
-            path = event.data.strip("{}")
-            if os.path.isfile(path):
-                self.audio_path_var.set(path)
-                self._log(f"已选择文件: {path}")
-
-        self.root.drop_target_register(DND_FILES)
-        self.root.dnd_bind("<<Drop>>", handle_drop)
-
-    def _choose_file(self) -> None:
-        filetypes = [
-            ("音频文件", "*.mp3 *.wav *.m4a *.flac *.ogg *.opus"),
-            ("所有文件", "*.*"),
-        ]
-        path = filedialog.askopenfilename(title="选择音频文件", filetypes=filetypes)
-        if path:
-            self.audio_path_var.set(path)
-            self._log(f"已选择文件: {path}")
-
-    def _choose_output(self) -> None:
-        path = filedialog.askdirectory(title="选择输出目录")
-        if path:
-            self.output_path_var.set(path)
-            self._log(f"输出目录: {path}")
-
-    def _start(self) -> None:
-        if self.start_button["state"] == tk.DISABLED:
-            return
-
-        if not self.audio_path_var.get():
-            messagebox.showwarning("缺少文件", "请先选择音频文件。")
-            return
-
-        options = self._collect_options()
-        if not options:
-            return
-
-        self.start_button.config(state=tk.DISABLED)
-        self.progress.start(10)
-        self._log("开始转录...")
-
-        thread = threading.Thread(target=self._run_transcription, args=(options,), daemon=True)
-        thread.start()
-
-    def _collect_options(self) -> Optional[TranscriptionOptions]:
+    def run(self) -> None:
         try:
-            temperature = float(self.temperature_var.get())
-            timeout = int(self.timeout_var.get())
-            retries = int(self.retries_var.get())
-            max_chars = int(self.max_chars_var.get())
-            max_duration = float(self.max_duration_var.get())
-            max_silence = float(self.max_silence_var.get())
-        except ValueError:
-            messagebox.showerror("参数错误", "请检查数值参数格式是否正确。")
-            return None
-
-        timestamps = [
-            value.strip() for value in self.timestamp_var.get().split(",") if value.strip()
-        ]
-
-        return TranscriptionOptions(
-            api_key=self.api_key_var.get().strip(),
-            model=self.model_var.get().strip(),
-            language=self.language_var.get().strip(),
-            prompt=self.prompt_var.get().strip(),
-            temperature=temperature,
-            response_format=self.response_format_var.get().strip(),
-            timestamp_granularities=timestamps,
-            timeout_seconds=timeout,
-            max_retries=retries,
-            max_chars_per_segment=max_chars,
-            max_segment_duration=max_duration,
-            max_silence_duration=max_silence,
-        )
-
-    def _run_transcription(self, options: TranscriptionOptions) -> None:
-        try:
-            output_path = self._transcribe(options)
-            self._log(f"完成! 输出文件: {output_path}")
-            messagebox.showinfo("完成", f"转录完成!\n{output_path}")
+            output_path = self._transcribe(self.options)
+            self.finished.emit(output_path)
         except Exception as exc:  # noqa: BLE001
-            self._log(f"错误: {exc}")
-            messagebox.showerror("错误", str(exc))
-        finally:
-            self.progress.stop()
-            self.start_button.config(state=tk.NORMAL)
+            self.failed.emit(str(exc))
 
     def _transcribe(self, options: TranscriptionOptions) -> str:
-        audio_path = self.audio_path_var.get()
-        output_dir = self.output_path_var.get() or os.path.dirname(audio_path)
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(options.output_dir, exist_ok=True)
 
         headers = {"Authorization": f"Bearer {options.api_key}"} if options.api_key else {}
 
         model_name = self._normalize_model(options.model)
         if model_name != options.model:
-            self._log(f"模型已自动补全为: {model_name}")
+            self.log_message.emit(f"模型已自动补全为: {model_name}")
 
         data = {
             "model": model_name,
@@ -291,15 +75,15 @@ class TranscriptionApp:
 
         payload = {key: value for key, value in data.items() if value is not None}
 
-        filename = os.path.splitext(os.path.basename(audio_path))[0]
+        filename = os.path.splitext(os.path.basename(options.audio_path))[0]
         output_extension = "srt" if options.response_format in {"srt", "vtt"} else "txt"
-        output_path = os.path.join(output_dir, f"{filename}.{output_extension}")
+        output_path = os.path.join(options.output_dir, f"{filename}.{output_extension}")
 
         for attempt in range(options.max_retries + 1):
             try:
-                with open(audio_path, "rb") as audio_file:
-                    files = {"file": (os.path.basename(audio_path), audio_file)}
-                    self._log("正在请求 API...")
+                with open(options.audio_path, "rb") as audio_file:
+                    files = {"file": (os.path.basename(options.audio_path), audio_file)}
+                    self.log_message.emit("正在请求 API...")
                     response = requests.post(
                         API_URL,
                         headers=headers,
@@ -330,7 +114,7 @@ class TranscriptionApp:
                         options.max_segment_duration,
                         options.max_silence_duration,
                     )
-                    output_path = os.path.join(output_dir, f"{filename}.srt")
+                    output_path = os.path.join(options.output_dir, f"{filename}.srt")
                     with open(output_path, "w", encoding="utf-8") as output_file:
                         output_file.write(srt)
                     return output_path
@@ -342,7 +126,7 @@ class TranscriptionApp:
                 if attempt >= options.max_retries:
                     raise exc
                 wait_time = 2 ** attempt
-                self._log(f"请求失败，{wait_time} 秒后重试: {exc}")
+                self.log_message.emit(f"请求失败，{wait_time} 秒后重试: {exc}")
                 time.sleep(wait_time)
 
         raise RuntimeError("无法完成转录，请检查网络或 API Key。")
@@ -509,15 +293,11 @@ class TranscriptionApp:
         status = response.status_code
         body = response.text.strip()
         if status == 402:
-            return (
-                "API 返回错误 402: 账户余额不足，请在 DeepInfra 控制台充值或配置自动续费。"
-            )
+            return "API 返回错误 402: 账户余额不足，请在 DeepInfra 控制台充值或配置自动续费。"
         if status == 401:
             return "API 返回错误 401: API Key 无效或缺失。"
         if status == 404:
-            return (
-                "API 返回错误 404: 模型不存在，请确认模型名称（如 openai/whisper-large-v3）。"
-            )
+            return "API 返回错误 404: 模型不存在，请确认模型名称（如 openai/whisper-large-v3）。"
         return f"API 返回错误 {status}: {body}"
 
     def _normalize_model(self, model: str) -> str:
@@ -528,25 +308,314 @@ class TranscriptionApp:
             return f"openai/{trimmed}"
         return trimmed
 
-    def _format_timestamp(self, seconds: float) -> str:
-        delta = timedelta(seconds=seconds)
-        total_seconds = int(delta.total_seconds())
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        secs = total_seconds % 60
-        milliseconds = int((seconds - total_seconds) * 1000)
-        return f"{hours:02}:{minutes:02}:{secs:02},{milliseconds:03}"
+
+class TranscriptionWindow(QtWidgets.QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("DeepInfra 语音转录字幕")
+        self.setMinimumSize(900, 760)
+        self.resize(980, 820)
+        self.setAcceptDrops(True)
+
+        self.worker_thread: Optional[QtCore.QThread] = None
+        self.worker: Optional[TranscriptionWorker] = None
+
+        self._build_ui()
+        self._apply_theme()
+        self._log("应用启动完成。拖放音频文件到窗口即可自动填入路径。")
+
+    def _build_ui(self) -> None:
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(18, 18, 18, 18)
+        main_layout.setSpacing(16)
+
+        self.file_group = QtWidgets.QGroupBox("音频文件")
+        file_layout = QtWidgets.QHBoxLayout(self.file_group)
+        self.audio_path_edit = QtWidgets.QLineEdit()
+        self.audio_path_edit.setPlaceholderText("选择或拖放音频文件...")
+        file_layout.addWidget(self.audio_path_edit)
+
+        browse_button = QtWidgets.QPushButton("选择文件")
+        browse_button.clicked.connect(self._choose_file)
+        file_layout.addWidget(browse_button)
+
+        main_layout.addWidget(self.file_group)
+
+        params_group = QtWidgets.QGroupBox("转录参数（全参数）")
+        params_layout = QtWidgets.QGridLayout(params_group)
+        params_layout.setColumnStretch(1, 1)
+        params_layout.setHorizontalSpacing(12)
+        params_layout.setVerticalSpacing(10)
+
+        self.api_key_edit = QtWidgets.QLineEdit()
+        self.api_key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.model_edit = QtWidgets.QLineEdit("openai/whisper-large-v3")
+        self.language_edit = QtWidgets.QLineEdit("zh")
+        self.prompt_edit = QtWidgets.QLineEdit()
+        self.temperature_edit = QtWidgets.QLineEdit("0")
+
+        self.response_format_combo = QtWidgets.QComboBox()
+        self.response_format_combo.addItems(["text", "json", "srt", "vtt", "verbose_json"])
+        self.response_format_combo.setCurrentText("verbose_json")
+
+        self.timestamp_edit = QtWidgets.QLineEdit("segment")
+        self.timeout_edit = QtWidgets.QLineEdit("300")
+        self.retries_edit = QtWidgets.QLineEdit("2")
+        self.max_chars_edit = QtWidgets.QLineEdit("20")
+        self.max_duration_edit = QtWidgets.QLineEdit("8.0")
+        self.max_silence_edit = QtWidgets.QLineEdit("1.0")
+
+        self._add_grid_row(params_layout, 0, "API Key", self.api_key_edit)
+        self._add_grid_row(params_layout, 1, "模型(model)", self.model_edit)
+        self._add_grid_row(params_layout, 2, "语言(language)", self.language_edit)
+        self._add_grid_row(params_layout, 3, "提示词(prompt)", self.prompt_edit)
+        self._add_grid_row(params_layout, 4, "温度(temperature)", self.temperature_edit)
+        self._add_grid_row(params_layout, 5, "返回格式(response_format)", self.response_format_combo)
+        self._add_grid_row(
+            params_layout,
+            6,
+            "时间粒度(timestamp_granularities)",
+            self.timestamp_edit,
+            hint="逗号分隔: segment,word",
+        )
+        self._add_grid_row(params_layout, 7, "请求超时(秒)", self.timeout_edit)
+        self._add_grid_row(params_layout, 8, "重试次数", self.retries_edit)
+        self._add_grid_row(params_layout, 9, "每段最大字符数", self.max_chars_edit)
+        self._add_grid_row(params_layout, 10, "每段最长时间(秒)", self.max_duration_edit)
+        self._add_grid_row(params_layout, 11, "每段最长停顿(秒)", self.max_silence_edit)
+
+        main_layout.addWidget(params_group)
+
+        output_group = QtWidgets.QGroupBox("输出")
+        output_layout = QtWidgets.QHBoxLayout(output_group)
+        self.output_dir_edit = QtWidgets.QLineEdit()
+        self.output_dir_edit.setPlaceholderText("选择输出目录（默认与音频同目录）")
+        output_layout.addWidget(self.output_dir_edit)
+
+        output_button = QtWidgets.QPushButton("选择输出目录")
+        output_button.clicked.connect(self._choose_output)
+        output_layout.addWidget(output_button)
+
+        main_layout.addWidget(output_group)
+
+        action_layout = QtWidgets.QHBoxLayout()
+        self.start_button = QtWidgets.QPushButton("一键启动转录")
+        self.start_button.clicked.connect(self._start)
+        action_layout.addWidget(self.start_button)
+
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setVisible(False)
+        action_layout.addWidget(self.progress)
+        main_layout.addLayout(action_layout)
+
+        log_group = QtWidgets.QGroupBox("日志")
+        log_layout = QtWidgets.QVBoxLayout(log_group)
+        self.log_text = QtWidgets.QTextEdit()
+        self.log_text.setReadOnly(True)
+        log_layout.addWidget(self.log_text)
+        main_layout.addWidget(log_group)
+
+    def _apply_theme(self) -> None:
+        palette = self.palette()
+        palette.setColor(QtGui.QPalette.Window, QtGui.QColor("#f6f7fb"))
+        palette.setColor(QtGui.QPalette.Base, QtGui.QColor("#ffffff"))
+        palette.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor("#eef2ff"))
+        palette.setColor(QtGui.QPalette.Text, QtGui.QColor("#1f2937"))
+        palette.setColor(QtGui.QPalette.Button, QtGui.QColor("#ffffff"))
+        palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor("#111827"))
+        palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor("#2563eb"))
+        palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("#ffffff"))
+        self.setPalette(palette)
+
+        self.setStyleSheet(
+            """
+            QGroupBox {
+                font-weight: 600;
+                border: 1px solid #e5e7eb;
+                border-radius: 10px;
+                margin-top: 8px;
+                padding: 12px;
+                background: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #111827;
+            }
+            QLabel { color: #1f2937; }
+            QLineEdit, QComboBox, QTextEdit {
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+                padding: 6px 8px;
+                background: #ffffff;
+            }
+            QLineEdit:focus, QComboBox:focus, QTextEdit:focus {
+                border: 1px solid #2563eb;
+            }
+            QPushButton {
+                background: #2563eb;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 14px;
+                font-weight: 600;
+            }
+            QPushButton:disabled {
+                background: #93c5fd;
+            }
+            QProgressBar {
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+                text-align: center;
+                background: #ffffff;
+            }
+            QProgressBar::chunk {
+                background-color: #60a5fa;
+            }
+            """
+        )
+
+    def _add_grid_row(
+        self,
+        layout: QtWidgets.QGridLayout,
+        row: int,
+        label: str,
+        widget: QtWidgets.QWidget,
+        hint: Optional[str] = None,
+    ) -> None:
+        label_widget = QtWidgets.QLabel(label)
+        layout.addWidget(label_widget, row, 0)
+        layout.addWidget(widget, row, 1)
+        if hint:
+            hint_label = QtWidgets.QLabel(hint)
+            hint_label.setStyleSheet("color: #6b7280;")
+            layout.addWidget(hint_label, row, 2)
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:  # noqa: N802
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        local_path = urls[0].toLocalFile()
+        if local_path and os.path.isfile(local_path):
+            self.audio_path_edit.setText(local_path)
+            self._log(f"已选择文件: {local_path}")
+
+    def _choose_file(self) -> None:
+        filetypes = "音频文件 (*.mp3 *.wav *.m4a *.flac *.ogg *.opus)"
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "选择音频文件", "", filetypes)
+        if path:
+            self.audio_path_edit.setText(path)
+            self._log(f"已选择文件: {path}")
+
+    def _choose_output(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "选择输出目录")
+        if path:
+            self.output_dir_edit.setText(path)
+            self._log(f"输出目录: {path}")
+
+    def _start(self) -> None:
+        if self.worker_thread and self.worker_thread.isRunning():
+            return
+
+        audio_path = self.audio_path_edit.text().strip()
+        if not audio_path:
+            QtWidgets.QMessageBox.warning(self, "缺少文件", "请先选择音频文件。")
+            return
+
+        options = self._collect_options()
+        if not options:
+            return
+
+        self.start_button.setEnabled(False)
+        self.progress.setVisible(True)
+        self._log("开始转录...")
+
+        self.worker_thread = QtCore.QThread()
+        self.worker = TranscriptionWorker(options)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.log_message.connect(self._log)
+        self.worker.finished.connect(self._finish_success)
+        self.worker.failed.connect(self._finish_error)
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.failed.connect(self.worker_thread.quit)
+        self.worker_thread.finished.connect(self._cleanup_worker)
+        self.worker_thread.start()
+
+    def _collect_options(self) -> Optional[TranscriptionOptions]:
+        try:
+            temperature = float(self.temperature_edit.text())
+            timeout = int(self.timeout_edit.text())
+            retries = int(self.retries_edit.text())
+            max_chars = int(self.max_chars_edit.text())
+            max_duration = float(self.max_duration_edit.text())
+            max_silence = float(self.max_silence_edit.text())
+        except ValueError:
+            QtWidgets.QMessageBox.critical(self, "参数错误", "请检查数值参数格式是否正确。")
+            return None
+
+        timestamps = [
+            value.strip() for value in self.timestamp_edit.text().split(",") if value.strip()
+        ]
+
+        audio_path = self.audio_path_edit.text().strip()
+        output_dir = self.output_dir_edit.text().strip() or os.path.dirname(audio_path)
+
+        return TranscriptionOptions(
+            api_key=self.api_key_edit.text().strip(),
+            model=self.model_edit.text().strip(),
+            language=self.language_edit.text().strip(),
+            prompt=self.prompt_edit.text().strip(),
+            temperature=temperature,
+            response_format=self.response_format_combo.currentText().strip(),
+            timestamp_granularities=timestamps,
+            timeout_seconds=timeout,
+            max_retries=retries,
+            max_chars_per_segment=max_chars,
+            max_segment_duration=max_duration,
+            max_silence_duration=max_silence,
+            audio_path=audio_path,
+            output_dir=output_dir,
+        )
+
+    def _finish_success(self, output_path: str) -> None:
+        self._log(f"完成! 输出文件: {output_path}")
+        QtWidgets.QMessageBox.information(self, "完成", f"转录完成!\n{output_path}")
+        self._finish_cleanup()
+
+    def _finish_error(self, message: str) -> None:
+        self._log(f"错误: {message}")
+        QtWidgets.QMessageBox.critical(self, "错误", message)
+        self._finish_cleanup()
+
+    def _finish_cleanup(self) -> None:
+        self.progress.setVisible(False)
+        self.start_button.setEnabled(True)
+
+    def _cleanup_worker(self) -> None:
+        if self.worker:
+            self.worker.deleteLater()
+        if self.worker_thread:
+            self.worker_thread.deleteLater()
+        self.worker = None
+        self.worker_thread = None
 
     def _log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.see(tk.END)
+        self.log_text.append(f"[{timestamp}] {message}")
 
 
 def main() -> None:
-    root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
-    app = TranscriptionApp(root)
-    root.mainloop()
+    app = QtWidgets.QApplication([])
+    window = TranscriptionWindow()
+    window.show()
+    app.exec_()
 
 
 if __name__ == "__main__":
