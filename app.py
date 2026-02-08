@@ -10,7 +10,6 @@ from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
 
 import requests
-import pysrt
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -377,22 +376,22 @@ class TranscriptionApp:
         return payload
 
     def _build_srt_from_words(self, words_data: List[dict]) -> str:
-        srt = pysrt.SubRipFile()
+        srt_lines = []
         for idx, word in enumerate(words_data, start=1):
             text = (word.get("word") or "").strip()
             if not text:
                 continue
             start = float(word.get("start", 0.0))
             end = float(word.get("end", start))
-            srt.append(
-                pysrt.SubRipItem(
-                    index=idx,
-                    start=pysrt.SubRipTime(milliseconds=int(start * 1000)),
-                    end=pysrt.SubRipTime(milliseconds=int(end * 1000)),
-                    text=text,
-                )
+            srt_lines.extend(
+                [
+                    str(idx),
+                    f"{self._format_timestamp(start)} --> {self._format_timestamp(end)}",
+                    text,
+                    "",
+                ]
             )
-        return str(srt)
+        return "\n".join(srt_lines).strip() + ("\n" if srt_lines else "")
 
     def _build_srt_from_segments(
         self,
@@ -444,18 +443,17 @@ class TranscriptionApp:
         for seg in merged:
             refined.extend(self._split_segment(seg, max_chars, max_duration))
 
-        srt = pysrt.SubRipFile()
+        srt_lines = []
         for idx, seg in enumerate(refined, start=1):
-            srt.append(
-                pysrt.SubRipItem(
-                    index=idx,
-                    start=pysrt.SubRipTime(milliseconds=int(seg.start * 1000)),
-                    end=pysrt.SubRipTime(milliseconds=int(seg.end * 1000)),
-                    text=seg.text,
-                )
+            srt_lines.extend(
+                [
+                    str(idx),
+                    f"{self._format_timestamp(seg.start)} --> {self._format_timestamp(seg.end)}",
+                    seg.text,
+                    "",
+                ]
             )
-
-        return str(srt)
+        return "\n".join(srt_lines).strip() + ("\n" if srt_lines else "")
 
     def _split_segment(self, segment: Segment, max_chars: int, max_duration: float) -> List[Segment]:
         text = segment.text.strip()
@@ -543,6 +541,14 @@ class TranscriptionApp:
         if "/" not in trimmed:
             return f"openai/{trimmed}"
         return trimmed
+
+    def _format_timestamp(self, seconds: float) -> str:
+        total_ms = max(int(seconds * 1000), 0)
+        hours = total_ms // 3_600_000
+        minutes = (total_ms % 3_600_000) // 60_000
+        secs = (total_ms % 60_000) // 1_000
+        milliseconds = total_ms % 1_000
+        return f"{hours:02}:{minutes:02}:{secs:02},{milliseconds:03}"
 
     def _build_api_url(self, api_url: str, model: str) -> str:
         base = api_url.strip().rstrip("/")
