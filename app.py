@@ -22,12 +22,13 @@ except ImportError:
     DND_FILES = None
 
 
-API_URL = "https://api.deepinfra.com/v1/openai/audio/transcriptions"
+API_URL = "https://api.deepinfra.com/v1/inference/openai/whisper-large-v3"
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_RETRIES = 2
 DEFAULT_MAX_CHARS_PER_SEGMENT = 20
 DEFAULT_MAX_SEGMENT_DURATION = 8.0
 DEFAULT_MAX_SILENCE_DURATION = 1.0
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".deepinfra_transcriber.json")
 
 
 @dataclass
@@ -58,6 +59,7 @@ class TranscriptionApp:
         self.root.minsize(860, 760)
 
         self._build_ui()
+        self._load_settings()
 
     def _build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=12)
@@ -121,6 +123,9 @@ class TranscriptionApp:
 
         self.start_button = ttk.Button(action_frame, text="一键启动转录", command=self._start)
         self.start_button.pack(side=tk.LEFT)
+
+        save_btn = ttk.Button(action_frame, text="保存默认设置", command=self._save_settings)
+        save_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         self.progress = ttk.Progressbar(action_frame, mode="indeterminate")
         self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
@@ -191,6 +196,43 @@ class TranscriptionApp:
             self.output_path_var.set(path)
             self._log(f"输出目录: {path}")
 
+    def _settings_snapshot(self) -> dict:
+        return {
+            "api_key": self.api_key_var.get().strip(),
+            "api_url": self.api_url_var.get().strip(),
+            "model": self.model_var.get().strip(),
+            "chunk_level": self.chunk_level_var.get().strip(),
+            "output_dir": self.output_path_var.get().strip(),
+        }
+
+    def _apply_settings(self, settings: dict) -> None:
+        self.api_key_var.set(settings.get("api_key", self.api_key_var.get()))
+        self.api_url_var.set(settings.get("api_url", self.api_url_var.get()))
+        self.model_var.set(settings.get("model", self.model_var.get()))
+        self.chunk_level_var.set(settings.get("chunk_level", self.chunk_level_var.get()))
+        self.output_path_var.set(settings.get("output_dir", self.output_path_var.get()))
+
+    def _load_settings(self) -> None:
+        if not os.path.isfile(SETTINGS_PATH):
+            return
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as settings_file:
+                settings = json.load(settings_file)
+            if isinstance(settings, dict):
+                self._apply_settings(settings)
+                self._log("已加载默认设置。")
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"默认设置加载失败: {exc}")
+
+    def _save_settings(self) -> None:
+        settings = self._settings_snapshot()
+        try:
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as settings_file:
+                json.dump(settings, settings_file, ensure_ascii=False, indent=2)
+            self._log("已保存默认设置。")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("保存失败", f"无法保存默认设置: {exc}")
+
     def _start(self) -> None:
         if self.start_button["state"] == tk.DISABLED:
             return
@@ -257,23 +299,24 @@ class TranscriptionApp:
             self._log(f"模型已自动补全为: {model_name}")
 
         data = {
-            "model": model_name,
-            "response_format": "verbose_json",
+            "task": "transcribe",
+            "chunk_level": options.chunk_level,
         }
-        data["timestamp_granularities"] = json.dumps([options.chunk_level])
 
         payload = {key: value for key, value in data.items() if value is not None}
 
         filename = os.path.splitext(os.path.basename(audio_path))[0]
         output_path = os.path.join(output_dir, f"{filename}.srt")
 
+        api_url = self._build_api_url(options.api_url, model_name)
+
         for attempt in range(options.max_retries + 1):
             try:
                 with open(audio_path, "rb") as audio_file:
-                    files = {"file": (os.path.basename(audio_path), audio_file)}
+                    files = {"audio": (os.path.basename(audio_path), audio_file)}
                     self._log("正在请求 API...")
                     response = requests.post(
-                        options.api_url,
+                        api_url,
                         headers=headers,
                         data=payload,
                         files=files,
@@ -488,6 +531,21 @@ class TranscriptionApp:
         if "/" not in trimmed:
             return f"openai/{trimmed}"
         return trimmed
+
+    def _build_api_url(self, api_url: str, model: str) -> str:
+        base = api_url.strip().rstrip("/")
+        if not base:
+            return API_URL
+
+        normalized_model = self._normalize_model(model)
+        if base.endswith(normalized_model):
+            return base
+        if base.endswith("/v1/inference"):
+            return f"{base}/{normalized_model}"
+        if "/v1/inference/" in base:
+            prefix = base.split("/v1/inference/")[0]
+            return f"{prefix}/v1/inference/{normalized_model}"
+        return base
 
     def _log(self, message: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
