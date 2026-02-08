@@ -325,7 +325,7 @@ class TranscriptionApp:
                 if response.status_code >= 400:
                     raise RuntimeError(self._format_api_error(response))
 
-                result = response.json()
+                result = self._extract_transcription_result(response.json())
                 srt = self._build_srt(
                     result,
                     options.chunk_level,
@@ -364,6 +364,18 @@ class TranscriptionApp:
             max_silence,
         )
 
+    def _extract_transcription_result(self, payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            return {}
+        output = payload.get("output")
+        if isinstance(output, dict):
+            return output
+        if isinstance(output, list) and output:
+            first = output[0]
+            if isinstance(first, dict):
+                return first
+        return payload
+
     def _build_srt_from_words(self, words_data: List[dict]) -> str:
         srt = pysrt.SubRipFile()
         for idx, word in enumerate(words_data, start=1):
@@ -380,7 +392,7 @@ class TranscriptionApp:
                     text=text,
                 )
             )
-        return srt.to_string()
+        return str(srt)
 
     def _build_srt_from_segments(
         self,
@@ -443,7 +455,7 @@ class TranscriptionApp:
                 )
             )
 
-        return srt.to_string()
+        return str(srt)
 
     def _split_segment(self, segment: Segment, max_chars: int, max_duration: float) -> List[Segment]:
         text = segment.text.strip()
