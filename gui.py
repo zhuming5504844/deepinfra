@@ -1,8 +1,3 @@
-"""Compatibility entrypoint.
-
-Use `gui.py` for packaging-friendly builds.
-"""
-
 from pathlib import Path
 import sys
 
