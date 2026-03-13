@@ -78,6 +78,9 @@ class TranscriptionApp:
         self._load_settings()
 
     def _build_ui(self) -> None:
+        style = ttk.Style(self.root)
+        style.configure("Action.TButton", padding=(10, 6))
+
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill=tk.BOTH, expand=True)
 
@@ -132,25 +135,44 @@ class TranscriptionApp:
 
         output_frame = ttk.LabelFrame(main, text="输出", padding=12)
         output_frame.pack(fill=tk.X, pady=(12, 0))
+        output_frame.columnconfigure(0, weight=1)
 
         self.output_path_var = tk.StringVar()
         output_entry = ttk.Entry(output_frame, textvariable=self.output_path_var)
-        output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        output_entry.grid(row=0, column=0, sticky=tk.EW)
 
         output_btn = ttk.Button(output_frame, text="选择输出目录", command=self._choose_output)
-        output_btn.pack(side=tk.LEFT, padx=(8, 0))
+        output_btn.grid(row=0, column=1, padx=(8, 0))
 
-        action_frame = ttk.Frame(main)
-        action_frame.pack(fill=tk.X, pady=(12, 0))
+        action_frame = ttk.LabelFrame(main, text="操作", padding=10)
+        action_frame.pack(fill=tk.X, pady=(10, 0))
+        action_frame.columnconfigure(1, weight=1)
 
-        self.start_button = ttk.Button(action_frame, text="一键启动转录", command=self._start)
+        button_group = ttk.Frame(action_frame)
+        button_group.grid(row=0, column=0, sticky=tk.W)
+
+        self.start_button = ttk.Button(
+            button_group,
+            text="一键启动转录",
+            command=self._start,
+            style="Action.TButton",
+        )
         self.start_button.pack(side=tk.LEFT)
 
-        save_btn = ttk.Button(action_frame, text="保存默认设置", command=self._save_settings)
+        save_btn = ttk.Button(
+            button_group,
+            text="保存默认设置",
+            command=self._save_settings,
+            style="Action.TButton",
+        )
         save_btn.pack(side=tk.LEFT, padx=(8, 0))
 
+        self.status_var = tk.StringVar(value="准备就绪")
+        status_label = ttk.Label(action_frame, textvariable=self.status_var, foreground="#555")
+        status_label.grid(row=0, column=1, sticky=tk.E, padx=(12, 0))
+
         self.progress = ttk.Progressbar(action_frame, mode="indeterminate")
-        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
+        self.progress.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
 
         log_frame = ttk.LabelFrame(main, text="日志", padding=12)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
@@ -302,6 +324,7 @@ class TranscriptionApp:
             return
 
         self.start_button.config(state=tk.DISABLED)
+        self.status_var.set("正在转录...")
         self.progress.start(10)
         self._log("开始转录...")
 
@@ -352,6 +375,7 @@ class TranscriptionApp:
         finally:
             self.progress.stop()
             self.start_button.config(state=tk.NORMAL)
+            self.status_var.set("准备就绪")
 
     def _transcribe(self, options: TranscriptionOptions, audio_path: str) -> str:
         output_dir = self.output_path_var.get() or os.path.dirname(audio_path)
