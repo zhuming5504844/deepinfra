@@ -24,10 +24,27 @@ except ImportError:
 API_URL = "https://api.deepinfra.com/v1/inference/openai/whisper-large-v3"
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_RETRIES = 2
+ASYNC_POLL_INTERVAL_SECONDS = 2
+ASYNC_POLL_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_CHARS_PER_SEGMENT = 20
 DEFAULT_MAX_SEGMENT_DURATION = 8.0
 DEFAULT_MAX_SILENCE_DURATION = 1.0
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".deepinfra_transcriber.json")
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".aac",
+    ".wma",
+    ".amr",
+    ".webm",
+    ".mp4",
+    ".mpeg",
+    ".mpga",
+}
 
 
 @dataclass
@@ -67,12 +84,24 @@ class TranscriptionApp:
         file_frame = ttk.LabelFrame(main, text="音频文件", padding=12)
         file_frame.pack(fill=tk.X)
 
-        self.audio_path_var = tk.StringVar()
-        audio_entry = ttk.Entry(file_frame, textvariable=self.audio_path_var)
-        audio_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.audio_listbox = tk.Listbox(file_frame, height=5, selectmode=tk.EXTENDED)
+        self.audio_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        audio_scroll = ttk.Scrollbar(file_frame, orient=tk.VERTICAL, command=self.audio_listbox.yview)
+        audio_scroll.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0))
+        self.audio_listbox.config(yscrollcommand=audio_scroll.set)
 
-        browse_btn = ttk.Button(file_frame, text="选择文件", command=self._choose_file)
-        browse_btn.pack(side=tk.LEFT, padx=(8, 0))
+        file_btns = ttk.Frame(file_frame)
+        file_btns.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(file_btns, text="添加文件", command=self._choose_files).pack(fill=tk.X)
+        ttk.Button(file_btns, text="移除选中", command=self._remove_selected_files).pack(
+            fill=tk.X, pady=(6, 0)
+        )
+        ttk.Button(file_btns, text="清空队列", command=self._clear_audio_files).pack(fill=tk.X, pady=(6, 0))
+
+        self.audio_count_var = tk.StringVar(value="队列: 0")
+        ttk.Label(file_frame, textvariable=self.audio_count_var, foreground="#666").pack(
+            side=tk.BOTTOM, anchor=tk.W, pady=(6, 0)
+        )
 
         if DND_AVAILABLE:
             drop_hint = ttk.Label(file_frame, text="(可拖放文件)", foreground="#666")
@@ -171,23 +200,65 @@ class TranscriptionApp:
             return
 
         def handle_drop(event: tk.Event) -> None:
-            path = event.data.strip("{}")
-            if os.path.isfile(path):
-                self.audio_path_var.set(path)
-                self._log(f"已选择文件: {path}")
+            dropped = self.root.tk.splitlist(event.data)
+            self._add_audio_files(dropped)
 
         self.root.drop_target_register(DND_FILES)
         self.root.dnd_bind("<<Drop>>", handle_drop)
 
-    def _choose_file(self) -> None:
+    def _choose_files(self) -> None:
         filetypes = [
-            ("音频文件", "*.mp3 *.wav *.m4a *.flac *.ogg *.opus"),
+            ("音频文件", "*.mp3 *.wav *.m4a *.flac *.ogg *.opus *.aac *.wma *.amr *.webm *.mp4 *.mpeg *.mpga"),
             ("所有文件", "*.*"),
         ]
-        path = filedialog.askopenfilename(title="选择音频文件", filetypes=filetypes)
-        if path:
-            self.audio_path_var.set(path)
-            self._log(f"已选择文件: {path}")
+        paths = filedialog.askopenfilenames(title="选择音频文件", filetypes=filetypes)
+        if paths:
+            self._add_audio_files(paths)
+
+    def _add_audio_files(self, paths) -> None:
+        existing = set(self.audio_listbox.get(0, tk.END))
+        added_count = 0
+        for path in paths:
+            normalized = path.strip("{}")
+            if not os.path.isfile(normalized):
+                continue
+            if not self._is_supported_audio_file(normalized):
+                self._log(f"已忽略不支持的格式: {normalized}")
+                continue
+            if normalized in existing:
+                continue
+            self.audio_listbox.insert(tk.END, normalized)
+            existing.add(normalized)
+            added_count += 1
+            self._log(f"已添加文件: {normalized}")
+        if added_count:
+            self._update_audio_count()
+
+    def _remove_selected_files(self) -> None:
+        selected = list(self.audio_listbox.curselection())
+        for index in reversed(selected):
+            self.audio_listbox.delete(index)
+        if selected:
+            self._log(f"已移除 {len(selected)} 个文件。")
+            self._update_audio_count()
+
+    def _clear_audio_files(self) -> None:
+        count = self.audio_listbox.size()
+        if count == 0:
+            return
+        self.audio_listbox.delete(0, tk.END)
+        self._log("已清空文件队列。")
+        self._update_audio_count()
+
+    def _get_audio_files(self) -> List[str]:
+        return list(self.audio_listbox.get(0, tk.END))
+
+    def _is_supported_audio_file(self, path: str) -> bool:
+        ext = os.path.splitext(path)[1].lower()
+        return ext in SUPPORTED_AUDIO_EXTENSIONS
+
+    def _update_audio_count(self) -> None:
+        self.audio_count_var.set(f"队列: {self.audio_listbox.size()}")
 
     def _choose_output(self) -> None:
         path = filedialog.askdirectory(title="选择输出目录")
@@ -236,8 +307,9 @@ class TranscriptionApp:
         if self.start_button["state"] == tk.DISABLED:
             return
 
-        if not self.audio_path_var.get():
-            messagebox.showwarning("缺少文件", "请先选择音频文件。")
+        audio_files = self._get_audio_files()
+        if not audio_files:
+            messagebox.showwarning("缺少文件", "请先添加至少一个音频文件。")
             return
 
         options = self._collect_options()
@@ -248,7 +320,11 @@ class TranscriptionApp:
         self.progress.start(10)
         self._log("开始转录...")
 
-        thread = threading.Thread(target=self._run_transcription, args=(options,), daemon=True)
+        thread = threading.Thread(
+            target=self._run_transcription,
+            args=(options, audio_files),
+            daemon=True,
+        )
         thread.start()
 
     def _collect_options(self) -> Optional[TranscriptionOptions]:
@@ -274,11 +350,17 @@ class TranscriptionApp:
             chunk_level=chunk_level or "segment",
         )
 
-    def _run_transcription(self, options: TranscriptionOptions) -> None:
+    def _run_transcription(self, options: TranscriptionOptions, audio_files: List[str]) -> None:
         try:
-            output_path = self._transcribe(options)
-            self._log(f"完成! 输出文件: {output_path}")
-            messagebox.showinfo("完成", f"转录完成!\n{output_path}")
+            output_paths = []
+            total = len(audio_files)
+            for index, audio_path in enumerate(audio_files, start=1):
+                self._log(f"[{index}/{total}] 开始处理: {audio_path}")
+                output_path = self._transcribe(options, audio_path)
+                output_paths.append(output_path)
+                self._log(f"[{index}/{total}] 完成: {output_path}")
+            summary = "\n".join(output_paths)
+            messagebox.showinfo("完成", f"批量转录完成，共 {len(output_paths)} 个文件:\n{summary}")
         except Exception as exc:  # noqa: BLE001
             self._log(f"错误: {exc}")
             messagebox.showerror("错误", str(exc))
@@ -286,8 +368,7 @@ class TranscriptionApp:
             self.progress.stop()
             self.start_button.config(state=tk.NORMAL)
 
-    def _transcribe(self, options: TranscriptionOptions) -> str:
-        audio_path = self.audio_path_var.get()
+    def _transcribe(self, options: TranscriptionOptions, audio_path: str) -> str:
         output_dir = self.output_path_var.get() or os.path.dirname(audio_path)
         os.makedirs(output_dir, exist_ok=True)
 
@@ -324,7 +405,9 @@ class TranscriptionApp:
                 if response.status_code >= 400:
                     raise RuntimeError(self._format_api_error(response))
 
-                result = self._extract_transcription_result(response.json())
+                result = self._extract_transcription_result(
+                    self._resolve_async_response(api_url, headers, response.json(), options)
+                )
                 srt = self._build_srt(
                     result,
                     options.chunk_level,
@@ -374,6 +457,45 @@ class TranscriptionApp:
             if isinstance(first, dict):
                 return first
         return payload
+
+    def _resolve_async_response(
+        self,
+        api_url: str,
+        headers: dict,
+        payload: dict,
+        options: TranscriptionOptions,
+    ) -> dict:
+        if not isinstance(payload, dict):
+            return payload
+
+        status = str(payload.get("status", "")).lower()
+        if status in {"", "completed", "succeeded", "success", "done"}:
+            return payload
+
+        status_url = payload.get("status_url") or payload.get("poll_url")
+        job_id = payload.get("id") or payload.get("request_id")
+        if not status_url and job_id:
+            status_url = f"{api_url.rstrip('/')}/{job_id}"
+        if not status_url:
+            return payload
+
+        deadline = time.time() + ASYNC_POLL_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            self._log(f"任务状态: {status or 'unknown'}，{ASYNC_POLL_INTERVAL_SECONDS} 秒后轮询...")
+            time.sleep(ASYNC_POLL_INTERVAL_SECONDS)
+            poll_resp = requests.get(status_url, headers=headers, timeout=options.timeout_seconds)
+            if poll_resp.status_code >= 400:
+                raise RuntimeError(self._format_api_error(poll_resp))
+            payload = poll_resp.json()
+            if not isinstance(payload, dict):
+                return payload
+            status = str(payload.get("status", "")).lower()
+            if status in {"completed", "succeeded", "success", "done"}:
+                return payload
+            if status in {"failed", "error", "cancelled"}:
+                raise RuntimeError(f"异步任务失败，状态: {status}")
+
+        raise TimeoutError(f"异步任务轮询超时（>{ASYNC_POLL_TIMEOUT_SECONDS} 秒）")
 
     def _build_srt_from_words(self, words_data: List[dict]) -> str:
         srt_lines = []
