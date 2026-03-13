@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 import textwrap
 import threading
 import time
@@ -29,6 +30,9 @@ ASYNC_POLL_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_CHARS_PER_SEGMENT = 20
 DEFAULT_MAX_SEGMENT_DURATION = 8.0
 DEFAULT_MAX_SILENCE_DURATION = 1.0
+DEFAULT_MAX_CPS = 15.0
+DEFAULT_MIN_SEGMENT_DURATION = 1.0
+DEFAULT_TIMELINE_PADDING = 0.06
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".deepinfra_transcriber.json")
 SUPPORTED_AUDIO_EXTENSIONS = {
     ".mp3",
@@ -65,6 +69,9 @@ class TranscriptionOptions:
     max_chars_per_segment: int = DEFAULT_MAX_CHARS_PER_SEGMENT
     max_segment_duration: float = DEFAULT_MAX_SEGMENT_DURATION
     max_silence_duration: float = DEFAULT_MAX_SILENCE_DURATION
+    max_cps: float = DEFAULT_MAX_CPS
+    min_segment_duration: float = DEFAULT_MIN_SEGMENT_DURATION
+    timeline_padding: float = DEFAULT_TIMELINE_PADDING
 
 
 class TranscriptionApp:
@@ -132,6 +139,25 @@ class TranscriptionApp:
         )
         chunk_box.state(["readonly"])
         self._add_row(grid, 3, "输出粒度", widget=chunk_box, hint="segment=段落, word=逐词")
+
+        subtitle_frame = ttk.LabelFrame(main, text="字幕优化", padding=12)
+        subtitle_frame.pack(fill=tk.X, pady=(12, 0))
+        subtitle_grid = ttk.Frame(subtitle_frame)
+        subtitle_grid.pack(fill=tk.X)
+
+        self.max_chars_var = tk.StringVar(value=str(DEFAULT_MAX_CHARS_PER_SEGMENT))
+        self.max_duration_var = tk.StringVar(value=str(DEFAULT_MAX_SEGMENT_DURATION))
+        self.max_silence_var = tk.StringVar(value=str(DEFAULT_MAX_SILENCE_DURATION))
+        self.max_cps_var = tk.StringVar(value=str(DEFAULT_MAX_CPS))
+        self.min_duration_var = tk.StringVar(value=str(DEFAULT_MIN_SEGMENT_DURATION))
+        self.timeline_padding_var = tk.StringVar(value=str(DEFAULT_TIMELINE_PADDING))
+
+        self._add_row(subtitle_grid, 0, "每条最大字符", self.max_chars_var)
+        self._add_row(subtitle_grid, 1, "最大时长(秒)", self.max_duration_var)
+        self._add_row(subtitle_grid, 2, "最大静音合并(秒)", self.max_silence_var)
+        self._add_row(subtitle_grid, 3, "最大 CPS", self.max_cps_var, hint="字符/秒")
+        self._add_row(subtitle_grid, 4, "最小时长(秒)", self.min_duration_var)
+        self._add_row(subtitle_grid, 5, "时间轴缓冲(秒)", self.timeline_padding_var)
 
         output_frame = ttk.LabelFrame(main, text="输出", padding=12)
         output_frame.pack(fill=tk.X, pady=(12, 0))
@@ -280,6 +306,12 @@ class TranscriptionApp:
             "model": self.model_var.get().strip(),
             "chunk_level": self.chunk_level_var.get().strip(),
             "output_dir": self.output_path_var.get().strip(),
+            "max_chars_per_segment": self.max_chars_var.get().strip(),
+            "max_segment_duration": self.max_duration_var.get().strip(),
+            "max_silence_duration": self.max_silence_var.get().strip(),
+            "max_cps": self.max_cps_var.get().strip(),
+            "min_segment_duration": self.min_duration_var.get().strip(),
+            "timeline_padding": self.timeline_padding_var.get().strip(),
         }
 
     def _apply_settings(self, settings: dict) -> None:
@@ -288,6 +320,12 @@ class TranscriptionApp:
         self.model_var.set(settings.get("model", self.model_var.get()))
         self.chunk_level_var.set(settings.get("chunk_level", self.chunk_level_var.get()))
         self.output_path_var.set(settings.get("output_dir", self.output_path_var.get()))
+        self.max_chars_var.set(str(settings.get("max_chars_per_segment", self.max_chars_var.get())))
+        self.max_duration_var.set(str(settings.get("max_segment_duration", self.max_duration_var.get())))
+        self.max_silence_var.set(str(settings.get("max_silence_duration", self.max_silence_var.get())))
+        self.max_cps_var.set(str(settings.get("max_cps", self.max_cps_var.get())))
+        self.min_duration_var.set(str(settings.get("min_segment_duration", self.min_duration_var.get())))
+        self.timeline_padding_var.set(str(settings.get("timeline_padding", self.timeline_padding_var.get())))
 
     def _load_settings(self) -> None:
         if not os.path.isfile(SETTINGS_PATH):
@@ -351,12 +389,51 @@ class TranscriptionApp:
             messagebox.showwarning("缺少模型", "请输入或选择模型名称。")
             return None
 
+        max_chars = self._parse_int_option(self.max_chars_var.get(), "每条最大字符", minimum=1)
+        max_duration = self._parse_float_option(self.max_duration_var.get(), "最大时长", minimum=0.1)
+        max_silence = self._parse_float_option(self.max_silence_var.get(), "最大静音合并", minimum=0.0)
+        max_cps = self._parse_float_option(self.max_cps_var.get(), "最大 CPS", minimum=1.0)
+        min_duration = self._parse_float_option(self.min_duration_var.get(), "最小时长", minimum=0.1)
+        timeline_padding = self._parse_float_option(
+            self.timeline_padding_var.get(), "时间轴缓冲", minimum=0.0
+        )
+        if None in {max_chars, max_duration, max_silence, max_cps, min_duration, timeline_padding}:
+            return None
+
         return TranscriptionOptions(
             api_key=api_key,
             api_url=api_url,
             model=model,
             chunk_level=chunk_level or "segment",
+            max_chars_per_segment=max_chars,
+            max_segment_duration=max_duration,
+            max_silence_duration=max_silence,
+            max_cps=max_cps,
+            min_segment_duration=min_duration,
+            timeline_padding=timeline_padding,
         )
+
+    def _parse_int_option(self, raw: str, label: str, minimum: int) -> Optional[int]:
+        try:
+            value = int(raw)
+        except ValueError:
+            messagebox.showwarning("参数错误", f"{label} 请输入整数。")
+            return None
+        if value < minimum:
+            messagebox.showwarning("参数错误", f"{label} 不能小于 {minimum}。")
+            return None
+        return value
+
+    def _parse_float_option(self, raw: str, label: str, minimum: float) -> Optional[float]:
+        try:
+            value = float(raw)
+        except ValueError:
+            messagebox.showwarning("参数错误", f"{label} 请输入数字。")
+            return None
+        if value < minimum:
+            messagebox.showwarning("参数错误", f"{label} 不能小于 {minimum}。")
+            return None
+        return value
 
     def _run_transcription(self, options: TranscriptionOptions, audio_files: List[str]) -> None:
         try:
@@ -423,6 +500,9 @@ class TranscriptionApp:
                     options.max_chars_per_segment,
                     options.max_segment_duration,
                     options.max_silence_duration,
+                    options.max_cps,
+                    options.min_segment_duration,
+                    options.timeline_padding,
                 )
                 with open(output_path, "w", encoding="utf-8") as output_file:
                     output_file.write(srt)
@@ -443,6 +523,9 @@ class TranscriptionApp:
         max_chars: int,
         max_duration: float,
         max_silence: float,
+        max_cps: float,
+        min_segment_duration: float,
+        timeline_padding: float,
     ) -> str:
         if chunk_level == "word":
             words = result.get("words", [])
@@ -453,6 +536,9 @@ class TranscriptionApp:
             max_chars,
             max_duration,
             max_silence,
+            max_cps,
+            min_segment_duration,
+            timeline_padding,
         )
 
     def _extract_transcription_result(self, payload: dict) -> dict:
@@ -530,6 +616,9 @@ class TranscriptionApp:
         max_chars: int,
         max_duration: float,
         max_silence: float,
+        max_cps: float,
+        min_segment_duration: float,
+        timeline_padding: float,
     ) -> str:
         segments: List[Segment] = []
         for segment in segments_data:
@@ -556,11 +645,7 @@ class TranscriptionApp:
             combined_text = f"{current.text} {seg.text}".strip()
             duration = seg.end - current.start
 
-            if (
-                len(combined_text) <= max_chars
-                and duration <= max_duration
-                and gap <= max_silence
-            ):
+            if self._should_merge_segments(current, seg, combined_text, duration, gap, max_chars, max_duration, max_silence):
                 current.end = seg.end
                 current.text = combined_text
             else:
@@ -574,6 +659,8 @@ class TranscriptionApp:
         for seg in merged:
             refined.extend(self._split_segment(seg, max_chars, max_duration))
 
+        refined = self._refine_timeline(refined, max_cps, min_segment_duration, timeline_padding)
+
         srt_lines = []
         for idx, seg in enumerate(refined, start=1):
             srt_lines.extend(
@@ -586,6 +673,28 @@ class TranscriptionApp:
             )
         return "\n".join(srt_lines).strip() + ("\n" if srt_lines else "")
 
+    def _should_merge_segments(
+        self,
+        current: Segment,
+        nxt: Segment,
+        combined_text: str,
+        duration: float,
+        gap: float,
+        max_chars: int,
+        max_duration: float,
+        max_silence: float,
+    ) -> bool:
+        if gap > max_silence:
+            return False
+        if len(combined_text) <= max_chars and duration <= max_duration:
+            return True
+
+        current_text = current.text.strip()
+        sentence_not_finished = bool(current_text) and current_text[-1] not in ".!?。！？"
+        if sentence_not_finished and len(current_text) <= int(max_chars * 0.7) and duration <= max_duration * 1.2:
+            return True
+        return False
+
     def _split_segment(self, segment: Segment, max_chars: int, max_duration: float) -> List[Segment]:
         text = segment.text.strip()
         if not text:
@@ -594,12 +703,7 @@ class TranscriptionApp:
         if max_chars <= 0:
             chunks = [text]
         else:
-            chunks = textwrap.wrap(
-                text,
-                width=max_chars,
-                break_long_words=True,
-                break_on_hyphens=False,
-            )
+            chunks = self._smart_wrap_text(text, max_chars)
 
         total_duration = max(segment.end - segment.start, 0.0)
         if max_duration > 0 and total_duration > 0:
@@ -608,12 +712,7 @@ class TranscriptionApp:
                 target_width = max(1, math.ceil(len(text) / required_count))
                 if max_chars > 0:
                     target_width = min(max_chars, target_width)
-                chunks = textwrap.wrap(
-                    text,
-                    width=target_width,
-                    break_long_words=True,
-                    break_on_hyphens=False,
-                )
+                chunks = self._smart_wrap_text(text, target_width)
             if len(chunks) < required_count:
                 chunks = self._ensure_chunk_count(chunks, required_count)
 
@@ -629,6 +728,48 @@ class TranscriptionApp:
             refined.append(Segment(current_start, chunk_end, chunk))
             current_start = chunk_end
         return refined
+
+    def _smart_wrap_text(self, text: str, width: int) -> List[str]:
+        rough_parts = textwrap.wrap(
+            text,
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        if not rough_parts:
+            return [text]
+
+        wrapped: List[str] = []
+        for part in rough_parts:
+            punctuated = re.split(r"(?<=[,，。！？.!?;；:：])\s+", part)
+            for chunk in punctuated:
+                chunk = chunk.strip()
+                if chunk:
+                    wrapped.append(chunk)
+        return wrapped or rough_parts
+
+    def _refine_timeline(
+        self,
+        segments: List[Segment],
+        max_cps: float,
+        min_segment_duration: float,
+        timeline_padding: float,
+    ) -> List[Segment]:
+        if not segments:
+            return []
+
+        adjusted: List[Segment] = []
+        prev_end = 0.0
+        for seg in segments:
+            start = max(seg.start, prev_end + timeline_padding)
+            duration = max(seg.end - start, min_segment_duration)
+            text_len = max(len(seg.text.strip()), 1)
+            cps_duration = text_len / max(max_cps, 0.1)
+            duration = max(duration, cps_duration)
+            end = start + duration
+            adjusted.append(Segment(start=start, end=end, text=seg.text.strip()))
+            prev_end = end
+        return adjusted
 
     def _ensure_chunk_count(self, chunks: List[str], target_count: int) -> List[str]:
         normalized = [chunk.strip() for chunk in chunks if chunk.strip()]
