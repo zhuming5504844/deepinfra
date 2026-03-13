@@ -98,14 +98,8 @@ class TranscriptionApp:
         )
         ttk.Button(file_btns, text="清空队列", command=self._clear_audio_files).pack(fill=tk.X, pady=(6, 0))
 
-        self.audio_count_var = tk.StringVar(value="队列: 0")
-        ttk.Label(file_frame, textvariable=self.audio_count_var, foreground="#666").pack(
-            side=tk.BOTTOM, anchor=tk.W, pady=(6, 0)
-        )
-
         if DND_AVAILABLE:
-            drop_hint = ttk.Label(file_frame, text="(可拖放文件)", foreground="#666")
-            drop_hint.pack(side=tk.LEFT, padx=(8, 0))
+            self._enable_drop()
 
         params_frame = ttk.LabelFrame(main, text="转录参数（必填项）", padding=12)
         params_frame.pack(fill=tk.X, pady=(12, 0))
@@ -167,8 +161,6 @@ class TranscriptionApp:
         self._log("应用启动完成。")
         if not DND_AVAILABLE:
             self._log("提示: 未安装 tkinterdnd2，拖放功能不可用。")
-        else:
-            self._enable_drop()
 
     def _add_row(
         self,
@@ -231,8 +223,6 @@ class TranscriptionApp:
             existing.add(normalized)
             added_count += 1
             self._log(f"已添加文件: {normalized}")
-        if added_count:
-            self._update_audio_count()
 
     def _remove_selected_files(self) -> None:
         selected = list(self.audio_listbox.curselection())
@@ -240,7 +230,6 @@ class TranscriptionApp:
             self.audio_listbox.delete(index)
         if selected:
             self._log(f"已移除 {len(selected)} 个文件。")
-            self._update_audio_count()
 
     def _clear_audio_files(self) -> None:
         count = self.audio_listbox.size()
@@ -248,7 +237,6 @@ class TranscriptionApp:
             return
         self.audio_listbox.delete(0, tk.END)
         self._log("已清空文件队列。")
-        self._update_audio_count()
 
     def _get_audio_files(self) -> List[str]:
         return list(self.audio_listbox.get(0, tk.END))
@@ -256,9 +244,6 @@ class TranscriptionApp:
     def _is_supported_audio_file(self, path: str) -> bool:
         ext = os.path.splitext(path)[1].lower()
         return ext in SUPPORTED_AUDIO_EXTENSIONS
-
-    def _update_audio_count(self) -> None:
-        self.audio_count_var.set(f"队列: {self.audio_listbox.size()}")
 
     def _choose_output(self) -> None:
         path = filedialog.askdirectory(title="选择输出目录")
