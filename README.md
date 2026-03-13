@@ -11,6 +11,20 @@
 - 一键启动脚本（Windows: `start.bat`，macOS/Linux: `start.sh`）
 - 预转录/异步转录前处理链路新增轮询间隔与整体超时控制，避免无限等待
 
+## 目录结构（便于打包 EXE）
+```text
+.
+├─ gui.py
+├─ pyproject.toml
+├─ requirements.txt
+├─ src/
+│  └─ deepinfra_transcriber/
+│     ├─ __init__.py
+│     └─ gui_app.py
+├─ start.bat
+└─ start.sh
+```
+
 ## 环境准备
 ```bash
 python -m venv .venv
@@ -28,6 +42,13 @@ pip install -r requirements.txt
   ```bat
   start.bat
   ```
+
+## 打包 EXE（PyInstaller）
+```bash
+pip install pyinstaller
+pyinstaller --noconfirm --onefile --windowed --name deepinfra-gui gui.py
+```
+打包完成后，产物在 `dist/deepinfra-gui.exe`。
 
 ## 说明
 默认使用 DeepInfra Inference 接口：

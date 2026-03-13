@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepinfra-transcriber"
+version = "0.1.0"
+description = "GUI tool for DeepInfra Whisper transcription and subtitle generation"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "requests>=2.31.0",
+  "tkinterdnd2>=0.3.0",
+]
+
+[project.scripts]
+deepinfra-gui = "deepinfra_transcriber.gui_app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

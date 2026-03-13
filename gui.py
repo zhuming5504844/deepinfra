@@ -1,8 +1,3 @@
-"""Compatibility entrypoint.
-
-Use `gui.py` for packaging-friendly builds.
-"""
-
 from deepinfra_transcriber.gui_app import main
 
 
