@@ -5,6 +5,7 @@ import textwrap
 import threading
 import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
@@ -24,6 +25,7 @@ except ImportError:
 API_URL = "https://api.deepinfra.com/v1/inference/openai/whisper-large-v3"
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_RETRIES = 2
+DEFAULT_BATCH_PARALLEL_JOBS = 3
 ASYNC_POLL_INTERVAL_SECONDS = 2
 ASYNC_POLL_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_CHARS_PER_SEGMENT = 20
@@ -360,13 +362,25 @@ class TranscriptionApp:
 
     def _run_transcription(self, options: TranscriptionOptions, audio_files: List[str]) -> None:
         try:
-            output_paths = []
+            output_paths = [""] * len(audio_files)
             total = len(audio_files)
-            for index, audio_path in enumerate(audio_files, start=1):
-                self._log(f"[{index}/{total}] 开始处理: {audio_path}")
-                output_path = self._transcribe(options, audio_path)
-                output_paths.append(output_path)
-                self._log(f"[{index}/{total}] 完成: {output_path}")
+            self._log(f"已启用批量模式，并行任务数: {DEFAULT_BATCH_PARALLEL_JOBS}")
+
+            with ThreadPoolExecutor(max_workers=DEFAULT_BATCH_PARALLEL_JOBS) as executor:
+                future_map = {}
+                for index, audio_path in enumerate(audio_files, start=1):
+                    self._log(f"[{index}/{total}] 已加入批处理队列: {audio_path}")
+                    future = executor.submit(self._transcribe, options, audio_path)
+                    future_map[future] = index - 1
+
+                completed = 0
+                for future in as_completed(future_map):
+                    output_path = future.result()
+                    item_index = future_map[future]
+                    output_paths[item_index] = output_path
+                    completed += 1
+                    self._log(f"[{completed}/{total}] 完成: {output_path}")
+
             summary = "\n".join(output_paths)
             messagebox.showinfo("完成", f"批量转录完成，共 {len(output_paths)} 个文件:\n{summary}")
         except Exception as exc:  # noqa: BLE001
@@ -697,6 +711,9 @@ class TranscriptionApp:
         return base
 
     def _log(self, message: str) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, self._log, message)
+            return
         timestamp = time.strftime("%H:%M:%S")
         self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
         self.log_text.see(tk.END)
