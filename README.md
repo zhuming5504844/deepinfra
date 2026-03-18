@@ -1,10 +1,10 @@
 # deepinfra
 
-本项目提供一个基于 PySide6 + qdarktheme 的 Python GUI，用于调用 DeepInfra Whisper API 完成语音转录并生成字幕。
+本项目提供一个基于 PySide6 + qdarktheme（pip 包名为 pyqtdarktheme） 的 Python GUI，用于调用 DeepInfra Whisper API 完成语音转录并生成字幕。
 
 ## 功能
 - 支持拖放或选择音频文件（支持常见音频格式）
-- 使用 PySide6 + qdarktheme 深色主题界面
+- 使用 PySide6 + qdarktheme（pip 包名为 pyqtdarktheme） 深色主题界面
 - 支持批量队列：添加文件 / 移除选中 / 清空队列
 - 可配置 API Key / API 地址 / 模型 / 输出粒度
 - 默认保存常用配置到本地设置文件
