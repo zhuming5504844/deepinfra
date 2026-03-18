@@ -6,6 +6,7 @@ Use `gui.py` for packaging-friendly builds.
 from pathlib import Path
 import importlib.util
 import sys
+import traceback
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_PATH = PROJECT_ROOT / "src"
@@ -25,6 +26,15 @@ def _missing_gui_dependencies() -> list[str]:
     return missing
 
 
+def _pause_before_exit() -> None:
+    if not sys.stdin or not sys.stdin.isatty():
+        return
+    try:
+        input("\n按回车键退出...")
+    except EOFError:
+        pass
+
+
 def _print_dependency_help(missing: list[str]) -> None:
     packages = " ".join(missing)
     print(
@@ -38,10 +48,17 @@ def _print_dependency_help(missing: list[str]) -> None:
 missing = _missing_gui_dependencies()
 if missing:
     _print_dependency_help(missing)
+    _pause_before_exit()
     raise SystemExit(1)
 
 from deepinfra_transcriber.gui_app import main
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:  # noqa: BLE001
+        print("启动失败，详细错误如下：", file=sys.stderr)
+        traceback.print_exc()
+        _pause_before_exit()
+        raise SystemExit(1)
