@@ -12,6 +12,7 @@ from typing import List, Optional
 import qdarktheme
 import requests
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -26,10 +28,11 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
-    QPlainTextEdit,
     QSizePolicy,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -64,16 +67,64 @@ SUPPORTED_AUDIO_EXTENSIONS = {
 def _apply_dark_theme(app: QApplication) -> None:
     if hasattr(qdarktheme, "setup_theme"):
         qdarktheme.setup_theme("auto")
-        return
+    else:
+        load_stylesheet = getattr(qdarktheme, "load_stylesheet", None)
+        if callable(load_stylesheet):
+            try:
+                stylesheet = load_stylesheet()
+            except TypeError:
+                stylesheet = load_stylesheet("dark")
+            if stylesheet:
+                app.setStyleSheet(stylesheet)
 
-    load_stylesheet = getattr(qdarktheme, "load_stylesheet", None)
-    if callable(load_stylesheet):
-        try:
-            stylesheet = load_stylesheet()
-        except TypeError:
-            stylesheet = load_stylesheet("dark")
-        if stylesheet:
-            app.setStyleSheet(stylesheet)
+    base_stylesheet = """
+    QWidget { font-size: 13px; }
+    QMainWindow { background: transparent; }
+    QFrame#pageContainer {
+        border-radius: 22px;
+        background-color: rgba(255, 255, 255, 0.02);
+    }
+    QFrame#heroCard {
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 20px;
+        background-color: rgba(120, 120, 120, 0.08);
+    }
+    QFrame#sectionCard {
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 18px;
+        background-color: rgba(255, 255, 255, 0.03);
+    }
+    QFrame#statCard {
+        border-radius: 14px;
+        background-color: rgba(255, 255, 255, 0.05);
+    }
+    QLabel#heroTitle { font-size: 24px; font-weight: 700; }
+    QLabel#heroSubtitle { color: palette(mid); font-size: 13px; }
+    QLabel#sectionTitle { font-size: 15px; font-weight: 700; }
+    QLabel#sectionDescription { color: palette(mid); }
+    QLabel#statValue { font-size: 18px; font-weight: 700; }
+    QLabel#statLabel { color: palette(mid); }
+    QPushButton {
+        min-height: 36px;
+        padding: 0 14px;
+        border-radius: 10px;
+    }
+    QPushButton#primaryButton { font-weight: 700; }
+    QLineEdit, QComboBox, QListWidget, QPlainTextEdit {
+        border-radius: 12px;
+        padding: 6px 8px;
+    }
+    QListWidget, QPlainTextEdit {
+        background-color: rgba(0, 0, 0, 0.12);
+    }
+    QProgressBar {
+        min-height: 12px;
+        border-radius: 6px;
+        text-align: center;
+    }
+    QProgressBar::chunk { border-radius: 6px; }
+    """
+    app.setStyleSheet(f"{app.styleSheet()}\n{base_stylesheet}")
 
 
 @dataclass
@@ -171,126 +222,282 @@ class TranscriptionApp(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("DeepInfra 语音转录字幕")
-        self.resize(920, 780)
-        self.setMinimumSize(920, 780)
+        self.resize(1380, 860)
+        self.setMinimumSize(1200, 760)
         self.thread_pool = QThreadPool.globalInstance()
+        self._worker: Optional[BatchTranscriptionWorker] = None
         self._build_ui()
         self._load_settings()
+        self._refresh_overview()
         self._log("应用启动完成。")
 
     def _build_ui(self) -> None:
         central = QWidget(self)
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(12, 12, 12, 12)
-        root_layout.setSpacing(12)
+        root_layout.setContentsMargins(18, 18, 18, 18)
+        root_layout.setSpacing(0)
 
-        file_group, file_layout = self._make_group("音频文件", QHBoxLayout)
+        page = QFrame()
+        page.setObjectName("pageContainer")
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(20, 20, 20, 20)
+        page_layout.setSpacing(16)
+        root_layout.addWidget(page)
 
+        page_layout.addWidget(self._build_header_card())
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._build_left_panel())
+        splitter.addWidget(self._build_right_panel())
+        splitter.setStretchFactor(0, 7)
+        splitter.setStretchFactor(1, 5)
+        page_layout.addWidget(splitter, stretch=1)
+
+    def _build_header_card(self) -> QWidget:
+        card = QFrame()
+        card.setObjectName("heroCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
+
+        title = QLabel("DeepInfra Whisper 批量转录工作台")
+        title.setObjectName("heroTitle")
+        subtitle = QLabel("新增现代化双栏布局、顶部标题区、原生日志面板与参数分组区域，便于后续继续扩展更多转录能力。")
+        subtitle.setObjectName("heroSubtitle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        stats_layout = QHBoxLayout()
+        stats_layout.setSpacing(12)
+        self.queue_stat = self._create_stat_card("0", "待处理文件")
+        self.output_stat = self._create_stat_card("SRT", "默认输出格式")
+        self.parallel_stat = self._create_stat_card(str(DEFAULT_BATCH_PARALLEL_JOBS), "并行任务数")
+        stats_layout.addWidget(self.queue_stat)
+        stats_layout.addWidget(self.output_stat)
+        stats_layout.addWidget(self.parallel_stat)
+        layout.addLayout(stats_layout)
+        return card
+
+    def _build_left_panel(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        layout.addWidget(self._build_file_section(), stretch=4)
+        layout.addWidget(self._build_form_section(), stretch=5)
+        layout.addWidget(self._build_action_section(), stretch=2)
+        return container
+
+    def _build_right_panel(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+        layout.addWidget(self._build_log_section(), stretch=1)
+        return container
+
+    def _build_file_section(self) -> QWidget:
+        card, body = self._make_group(
+            "音频队列",
+            "支持拖拽导入音频文件，适合批量转录与字幕导出。",
+            QHBoxLayout,
+        )
         self.audio_list = DropListWidget()
-        self.audio_list.setMinimumHeight(140)
+        self.audio_list.setMinimumHeight(220)
         self.audio_list.files_dropped.connect(self._add_audio_files)
-        file_layout.addWidget(self.audio_list, stretch=1)
+        body.addWidget(self.audio_list, stretch=1)
 
-        file_buttons = QVBoxLayout()
+        actions = QVBoxLayout()
+        actions.setSpacing(10)
         self.add_file_button = QPushButton("添加文件")
         self.add_file_button.clicked.connect(self._choose_files)
-        file_buttons.addWidget(self.add_file_button)
+        actions.addWidget(self.add_file_button)
 
         self.remove_button = QPushButton("移除选中")
         self.remove_button.clicked.connect(self._remove_selected_files)
-        file_buttons.addWidget(self.remove_button)
+        actions.addWidget(self.remove_button)
 
         self.clear_button = QPushButton("清空队列")
         self.clear_button.clicked.connect(self._clear_audio_files)
-        file_buttons.addWidget(self.clear_button)
-        file_buttons.addStretch(1)
-        file_layout.addLayout(file_buttons)
-        root_layout.addWidget(file_group)
+        actions.addWidget(self.clear_button)
 
-        params_group, params_container = self._make_group("转录参数（必填项）")
-        params_form = QFormLayout()
-        params_container.addLayout(params_form)
-        params_form.setLabelAlignment(Qt.AlignLeft)
+        tip = QLabel("拖拽文件到左侧列表即可加入任务队列。")
+        tip.setObjectName("sectionDescription")
+        tip.setWordWrap(True)
+        actions.addWidget(tip)
+        actions.addStretch(1)
+        body.addLayout(actions)
+        return card
+
+    def _build_form_section(self) -> QWidget:
+        card, body = self._make_group(
+            "参数配置",
+            "将常用参数拆分为多个分组区域，方便扩展更多模型与高级选项。",
+            QVBoxLayout,
+        )
+
+        required_frame = QFrame()
+        required_layout = QFormLayout(required_frame)
+        required_layout.setContentsMargins(0, 0, 0, 0)
+        required_layout.setHorizontalSpacing(14)
+        required_layout.setVerticalSpacing(12)
+        required_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         self.api_key_input = QLineEdit()
         self.api_key_input.setEchoMode(QLineEdit.Password)
-        params_form.addRow("API Key", self.api_key_input)
+        self.api_key_input.setPlaceholderText("输入 DeepInfra API Key")
+        required_layout.addRow("API Key", self.api_key_input)
 
         self.api_url_input = QLineEdit(API_URL)
-        params_form.addRow("API 地址", self.api_url_input)
+        self.api_url_input.setPlaceholderText("推理接口地址")
+        required_layout.addRow("API 地址", self.api_url_input)
 
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
         self.model_combo.addItems(["openai/whisper-large-v3", "openai/whisper-large-v2"])
-        params_form.addRow("模型(model)", self.model_combo)
+        required_layout.addRow("模型", self.model_combo)
+        body.addWidget(self._wrap_subsection("核心参数", "转录请求必须填写的基础信息。", required_frame))
 
-        chunk_row = QWidget()
-        chunk_layout = QHBoxLayout(chunk_row)
-        chunk_layout.setContentsMargins(0, 0, 0, 0)
-        chunk_layout.setSpacing(8)
+        output_grid = QGridLayout()
+        output_grid.setContentsMargins(0, 0, 0, 0)
+        output_grid.setHorizontalSpacing(12)
+        output_grid.setVerticalSpacing(12)
+
         self.chunk_level_combo = QComboBox()
         self.chunk_level_combo.addItems(["segment", "word"])
-        chunk_layout.addWidget(self.chunk_level_combo)
-        hint = QLabel("segment=段落, word=逐词")
-        hint.setStyleSheet("color: #888;")
-        chunk_layout.addWidget(hint)
-        chunk_layout.addStretch(1)
-        params_form.addRow("输出粒度", chunk_row)
-        root_layout.addWidget(params_group)
+        output_grid.addWidget(QLabel("输出粒度"), 0, 0)
+        output_grid.addWidget(self.chunk_level_combo, 0, 1)
 
-        output_group, output_layout = self._make_group("输出", QHBoxLayout)
+        chunk_hint = QLabel("segment = 段落字幕，word = 逐词对齐。")
+        chunk_hint.setObjectName("sectionDescription")
+        output_grid.addWidget(chunk_hint, 1, 0, 1, 2)
+
         self.output_path_input = QLineEdit()
-        output_layout.addWidget(self.output_path_input, stretch=1)
+        self.output_path_input.setPlaceholderText("为空时默认输出到音频所在目录")
+        output_grid.addWidget(QLabel("输出目录"), 2, 0)
+        output_grid.addWidget(self.output_path_input, 2, 1)
+
         self.output_button = QPushButton("选择输出目录")
         self.output_button.clicked.connect(self._choose_output)
-        output_layout.addWidget(self.output_button)
-        root_layout.addWidget(output_group)
+        output_grid.addWidget(self.output_button, 3, 1, alignment=Qt.AlignRight)
+        body.addWidget(self._wrap_subsection("导出与字幕", "控制转录粒度与字幕保存位置。", output_grid))
 
-        action_group, action_layout = self._make_group("操作", QVBoxLayout)
-        top_row = QHBoxLayout()
+        return card
+
+    def _build_action_section(self) -> QWidget:
+        card, body = self._make_group(
+            "执行控制",
+            "保留原生 Qt 进度条与状态提示，便于后续扩展取消任务、历史记录等功能。",
+            QVBoxLayout,
+        )
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(12)
         self.start_button = QPushButton("一键启动转录")
+        self.start_button.setObjectName("primaryButton")
+        self.start_button.setMinimumHeight(42)
         self.start_button.clicked.connect(self._start)
-        self.start_button.setMinimumHeight(38)
-        top_row.addWidget(self.start_button)
+        buttons.addWidget(self.start_button, stretch=2)
 
         self.save_button = QPushButton("保存默认设置")
+        self.save_button.setMinimumHeight(42)
         self.save_button.clicked.connect(self._save_settings)
-        self.save_button.setMinimumHeight(38)
-        top_row.addWidget(self.save_button)
-        top_row.addStretch(1)
+        buttons.addWidget(self.save_button, stretch=1)
+        body.addLayout(buttons)
 
+        status_row = QHBoxLayout()
+        status_caption = QLabel("当前状态")
+        status_caption.setObjectName("sectionDescription")
         self.status_label = QLabel("准备就绪")
         self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        top_row.addWidget(self.status_label)
-        action_layout.addLayout(top_row)
+        status_row.addWidget(status_caption)
+        status_row.addWidget(self.status_label)
+        body.addLayout(status_row)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
-        action_layout.addWidget(self.progress)
-        root_layout.addWidget(action_group)
+        body.addWidget(self.progress)
+        return card
 
-        log_group, log_layout = self._make_group("日志", QVBoxLayout)
+    def _build_log_section(self) -> QWidget:
+        card, body = self._make_group(
+            "运行日志",
+            "使用原生日志面板实时展示导入、请求、重试与完成状态，便于排查问题。",
+            QVBoxLayout,
+        )
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
-        log_layout.addWidget(self.log_text)
-        root_layout.addWidget(log_group, stretch=1)
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.Monospace)
+        self.log_text.setFont(font)
+        self.log_text.setPlaceholderText("这里会显示详细的运行日志…")
+        body.addWidget(self.log_text, stretch=1)
+        return card
 
-    def _make_group(self, title: str, body_layout_cls=QVBoxLayout):
+    def _create_stat_card(self, value: str, label: str) -> QFrame:
+        card = QFrame()
+        card.setObjectName("statCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(4)
+        value_label = QLabel(value)
+        value_label.setObjectName("statValue")
+        text_label = QLabel(label)
+        text_label.setObjectName("statLabel")
+        layout.addWidget(value_label)
+        layout.addWidget(text_label)
+        card.value_label = value_label
+        return card
+
+    def _wrap_subsection(self, title: str, description: str, content) -> QFrame:
+        frame = QFrame()
+        inner = QVBoxLayout(frame)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(10)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("sectionTitle")
+        desc_label = QLabel(description)
+        desc_label.setObjectName("sectionDescription")
+        desc_label.setWordWrap(True)
+        inner.addWidget(title_label)
+        inner.addWidget(desc_label)
+
+        if isinstance(content, QWidget):
+            inner.addWidget(content)
+        else:
+            inner.addLayout(content)
+        return frame
+
+    def _make_group(self, title: str, description: str, body_layout_cls=QVBoxLayout):
         group = QFrame()
-        group.setFrameShape(QFrame.StyledPanel)
-        group.setObjectName("groupBox")
+        group.setObjectName("sectionCard")
         wrapper = QVBoxLayout(group)
-        wrapper.setContentsMargins(12, 16, 12, 12)
-        wrapper.setSpacing(10)
+        wrapper.setContentsMargins(18, 18, 18, 18)
+        wrapper.setSpacing(14)
+
         header = QLabel(title)
-        header.setStyleSheet("font-weight: 600; font-size: 14px;")
+        header.setObjectName("sectionTitle")
+        desc = QLabel(description)
+        desc.setObjectName("sectionDescription")
+        desc.setWordWrap(True)
         wrapper.addWidget(header)
+        wrapper.addWidget(desc)
+
         body_layout = body_layout_cls()
         wrapper.addLayout(body_layout)
         return group, body_layout
+
+    def _refresh_overview(self) -> None:
+        self.queue_stat.value_label.setText(str(self.audio_list.count()))
+        self.output_stat.value_label.setText("SRT")
+        self.parallel_stat.value_label.setText(str(DEFAULT_BATCH_PARALLEL_JOBS))
 
     def _choose_files(self) -> None:
         file_filter = (
@@ -302,6 +509,7 @@ class TranscriptionApp(QMainWindow):
 
     def _add_audio_files(self, paths: List[str]) -> None:
         existing = set(self._get_audio_files())
+        added_count = 0
         for path in paths:
             normalized = path.strip().strip("{}")
             if not normalized or not os.path.isfile(normalized):
@@ -313,7 +521,10 @@ class TranscriptionApp(QMainWindow):
                 continue
             self.audio_list.addItem(QListWidgetItem(normalized))
             existing.add(normalized)
+            added_count += 1
             self._log(f"已添加文件: {normalized}")
+        if added_count:
+            self._refresh_overview()
 
     def _remove_selected_files(self) -> None:
         selected = self.audio_list.selectedItems()
@@ -322,12 +533,14 @@ class TranscriptionApp(QMainWindow):
             self.audio_list.takeItem(row)
         if selected:
             self._log(f"已移除 {len(selected)} 个文件。")
+            self._refresh_overview()
 
     def _clear_audio_files(self) -> None:
         count = self.audio_list.count()
         if count == 0:
             return
         self.audio_list.clear()
+        self._refresh_overview()
         self._log("已清空文件队列。")
 
     def _get_audio_files(self) -> List[str]:
@@ -384,6 +597,7 @@ class TranscriptionApp(QMainWindow):
         self.add_file_button.setEnabled(not is_running)
         self.remove_button.setEnabled(not is_running)
         self.clear_button.setEnabled(not is_running)
+        self.output_button.setEnabled(not is_running)
         if is_running:
             self.progress.setRange(0, 0)
             self.status_label.setText("正在转录...")
@@ -727,14 +941,19 @@ class TranscriptionApp(QMainWindow):
         self.log_text.appendPlainText(f"[{timestamp}] {message}")
 
 
-def main() -> None:
-    app = QApplication.instance() or QApplication(sys.argv)
+def main() -> int:
+    app = QApplication.instance()
+    owns_app = app is None
+    if owns_app:
+        app = QApplication(sys.argv)
+    assert app is not None
     app.setApplicationName("deepinfra-transcriber")
     _apply_dark_theme(app)
     window = TranscriptionApp()
     window.show()
-    app.exec()
+    result = app.exec()
+    return int(result)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
