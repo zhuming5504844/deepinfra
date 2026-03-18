@@ -61,6 +61,21 @@ SUPPORTED_AUDIO_EXTENSIONS = {
 }
 
 
+def _apply_dark_theme(app: QApplication) -> None:
+    if hasattr(qdarktheme, "setup_theme"):
+        qdarktheme.setup_theme("auto")
+        return
+
+    load_stylesheet = getattr(qdarktheme, "load_stylesheet", None)
+    if callable(load_stylesheet):
+        try:
+            stylesheet = load_stylesheet()
+        except TypeError:
+            stylesheet = load_stylesheet("dark")
+        if stylesheet:
+            app.setStyleSheet(stylesheet)
+
+
 @dataclass
 class Segment:
     start: float
@@ -715,7 +730,7 @@ class TranscriptionApp(QMainWindow):
 def main() -> None:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("deepinfra-transcriber")
-    qdarktheme.setup_theme("auto")
+    _apply_dark_theme(app)
     window = TranscriptionApp()
     window.show()
     app.exec()

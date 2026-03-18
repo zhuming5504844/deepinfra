@@ -17,7 +17,7 @@ if str(SRC_PATH) not in sys.path:
 def _missing_gui_dependencies() -> list[str]:
     module_checks = {
         "PySide6": "PySide6",
-        "qdarktheme": "pyqtdarktheme",
+        "qdarktheme": "qdarktheme",
     }
     missing = []
     for module_name, package_name in module_checks.items():
