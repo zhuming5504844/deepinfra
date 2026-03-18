@@ -1,13 +1,15 @@
 # deepinfra
 
-本项目提供一个 Python GUI，用于调用 DeepInfra Whisper API 完成语音转录并生成字幕。
+本项目提供一个基于 PySide6 + qdarktheme 的 Python GUI，用于调用 DeepInfra Whisper API 完成语音转录并生成字幕。
 
 ## 功能
 - 支持拖放或选择音频文件（支持常见音频格式）
+- 使用 PySide6 + qdarktheme 深色主题界面
 - 支持批量队列：添加文件 / 移除选中 / 清空队列
 - 可配置 API Key / API 地址 / 模型 / 输出粒度
 - 默认保存常用配置到本地设置文件
 - 内置运行日志
+- 后台线程 + 批量并发执行，转录期间 UI 保持响应
 - 一键启动脚本（Windows: `start.bat`，macOS/Linux: `start.sh`）
 - 预转录/异步转录前处理链路新增轮询间隔与整体超时控制，避免无限等待
 
@@ -48,6 +50,8 @@ pip install -r requirements.txt
 pip install pyinstaller
 pyinstaller --noconfirm --onefile --windowed --name deepinfra-gui gui.py
 ```
+
+> 打包 PySide6 应用时，如需更稳妥地包含 Qt 依赖，建议在目标环境中实际执行一次打包验证。
 打包完成后，产物在 `dist/deepinfra-gui.exe`。
 
 ## 说明

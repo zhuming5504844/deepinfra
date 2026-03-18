@@ -1,26 +1,38 @@
 import json
 import math
 import os
+import sys
 import textwrap
-import threading
 import time
-import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from tkinter import filedialog, messagebox, ttk
+from pathlib import Path
 from typing import List, Optional
 
+import qdarktheme
 import requests
-
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-
-    DND_AVAILABLE = True
-except ImportError:
-    DND_AVAILABLE = False
-    TkinterDnD = tk.Tk
-    DND_FILES = None
-
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtWidgets import (
+    QApplication,
+    QAbstractItemView,
+    QComboBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QPlainTextEdit,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 API_URL = "https://api.deepinfra.com/v1/inference/openai/whisper-large-v3"
 DEFAULT_TIMEOUT_SECONDS = 300
@@ -62,6 +74,7 @@ class TranscriptionOptions:
     api_url: str
     model: str
     chunk_level: str
+    output_dir: str
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_RETRIES
     max_chars_per_segment: int = DEFAULT_MAX_CHARS_PER_SEGMENT
@@ -69,227 +82,266 @@ class TranscriptionOptions:
     max_silence_duration: float = DEFAULT_MAX_SILENCE_DURATION
 
 
-class TranscriptionApp:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("DeepInfra 语音转录字幕")
-        self.root.geometry("860x760")
-        self.root.minsize(860, 760)
+class DropListWidget(QListWidget):
+    files_dropped = Signal(list)
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
+
+
+class WorkerSignals(QObject):
+    log = Signal(str)
+    status = Signal(str)
+    finished = Signal(list)
+    error = Signal(str)
+
+
+class BatchTranscriptionWorker(QRunnable):
+    def __init__(self, app: "TranscriptionApp", options: TranscriptionOptions, audio_files: List[str]) -> None:
+        super().__init__()
+        self.app = app
+        self.options = options
+        self.audio_files = audio_files
+        self.signals = WorkerSignals()
+
+    def run(self) -> None:
+        try:
+            output_paths = [""] * len(self.audio_files)
+            total = len(self.audio_files)
+            self.signals.log.emit(f"已启用批量模式，并行任务数: {DEFAULT_BATCH_PARALLEL_JOBS}")
+            with ThreadPoolExecutor(max_workers=DEFAULT_BATCH_PARALLEL_JOBS) as executor:
+                future_map = {}
+                for index, audio_path in enumerate(self.audio_files, start=1):
+                    self.signals.log.emit(f"[{index}/{total}] 已加入批处理队列: {audio_path}")
+                    future = executor.submit(self.app._transcribe, self.options, audio_path, self.signals)
+                    future_map[future] = index - 1
+
+                completed = 0
+                for future in as_completed(future_map):
+                    output_path = future.result()
+                    item_index = future_map[future]
+                    output_paths[item_index] = output_path
+                    completed += 1
+                    self.signals.status.emit(f"正在转录... {completed}/{total}")
+                    self.signals.log.emit(f"[{completed}/{total}] 完成: {output_path}")
+
+            self.signals.finished.emit(output_paths)
+        except Exception as exc:  # noqa: BLE001
+            self.signals.error.emit(str(exc))
+
+
+class TranscriptionApp(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("DeepInfra 语音转录字幕")
+        self.resize(920, 780)
+        self.setMinimumSize(920, 780)
+        self.thread_pool = QThreadPool.globalInstance()
         self._build_ui()
         self._load_settings()
+        self._log("应用启动完成。")
 
     def _build_ui(self) -> None:
-        style = ttk.Style(self.root)
-        style.configure("Action.TButton", padding=(10, 6))
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setSpacing(12)
 
-        main = ttk.Frame(self.root, padding=12)
-        main.pack(fill=tk.BOTH, expand=True)
+        file_group, file_layout = self._make_group("音频文件", QHBoxLayout)
 
-        file_frame = ttk.LabelFrame(main, text="音频文件", padding=12)
-        file_frame.pack(fill=tk.X)
+        self.audio_list = DropListWidget()
+        self.audio_list.setMinimumHeight(140)
+        self.audio_list.files_dropped.connect(self._add_audio_files)
+        file_layout.addWidget(self.audio_list, stretch=1)
 
-        self.audio_listbox = tk.Listbox(file_frame, height=5, selectmode=tk.EXTENDED)
-        self.audio_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        audio_scroll = ttk.Scrollbar(file_frame, orient=tk.VERTICAL, command=self.audio_listbox.yview)
-        audio_scroll.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0))
-        self.audio_listbox.config(yscrollcommand=audio_scroll.set)
+        file_buttons = QVBoxLayout()
+        self.add_file_button = QPushButton("添加文件")
+        self.add_file_button.clicked.connect(self._choose_files)
+        file_buttons.addWidget(self.add_file_button)
 
-        file_btns = ttk.Frame(file_frame)
-        file_btns.pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(file_btns, text="添加文件", command=self._choose_files).pack(fill=tk.X)
-        ttk.Button(file_btns, text="移除选中", command=self._remove_selected_files).pack(
-            fill=tk.X, pady=(6, 0)
-        )
-        ttk.Button(file_btns, text="清空队列", command=self._clear_audio_files).pack(fill=tk.X, pady=(6, 0))
+        self.remove_button = QPushButton("移除选中")
+        self.remove_button.clicked.connect(self._remove_selected_files)
+        file_buttons.addWidget(self.remove_button)
 
-        if DND_AVAILABLE:
-            self._enable_drop()
+        self.clear_button = QPushButton("清空队列")
+        self.clear_button.clicked.connect(self._clear_audio_files)
+        file_buttons.addWidget(self.clear_button)
+        file_buttons.addStretch(1)
+        file_layout.addLayout(file_buttons)
+        root_layout.addWidget(file_group)
 
-        params_frame = ttk.LabelFrame(main, text="转录参数（必填项）", padding=12)
-        params_frame.pack(fill=tk.X, pady=(12, 0))
+        params_group, params_container = self._make_group("转录参数（必填项）")
+        params_form = QFormLayout()
+        params_container.addLayout(params_form)
+        params_form.setLabelAlignment(Qt.AlignLeft)
 
-        grid = ttk.Frame(params_frame)
-        grid.pack(fill=tk.X)
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setEchoMode(QLineEdit.Password)
+        params_form.addRow("API Key", self.api_key_input)
 
-        self.api_key_var = tk.StringVar()
-        self.api_url_var = tk.StringVar(value=API_URL)
-        self.model_var = tk.StringVar(value="openai/whisper-large-v3")
-        self.chunk_level_var = tk.StringVar(value="segment")
+        self.api_url_input = QLineEdit(API_URL)
+        params_form.addRow("API 地址", self.api_url_input)
 
-        self._add_row(grid, 0, "API Key", self.api_key_var, show="*")
-        self._add_row(grid, 1, "API 地址", self.api_url_var)
-        model_box = ttk.Combobox(
-            grid,
-            textvariable=self.model_var,
-            values=["openai/whisper-large-v3", "openai/whisper-large-v2"],
-        )
-        self._add_row(grid, 2, "模型(model)", widget=model_box)
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(True)
+        self.model_combo.addItems(["openai/whisper-large-v3", "openai/whisper-large-v2"])
+        params_form.addRow("模型(model)", self.model_combo)
 
-        chunk_box = ttk.Combobox(
-            grid,
-            textvariable=self.chunk_level_var,
-            values=["segment", "word"],
-            width=18,
-        )
-        chunk_box.state(["readonly"])
-        self._add_row(grid, 3, "输出粒度", widget=chunk_box, hint="segment=段落, word=逐词")
+        chunk_row = QWidget()
+        chunk_layout = QHBoxLayout(chunk_row)
+        chunk_layout.setContentsMargins(0, 0, 0, 0)
+        chunk_layout.setSpacing(8)
+        self.chunk_level_combo = QComboBox()
+        self.chunk_level_combo.addItems(["segment", "word"])
+        chunk_layout.addWidget(self.chunk_level_combo)
+        hint = QLabel("segment=段落, word=逐词")
+        hint.setStyleSheet("color: #888;")
+        chunk_layout.addWidget(hint)
+        chunk_layout.addStretch(1)
+        params_form.addRow("输出粒度", chunk_row)
+        root_layout.addWidget(params_group)
 
-        output_frame = ttk.LabelFrame(main, text="输出", padding=12)
-        output_frame.pack(fill=tk.X, pady=(12, 0))
-        output_frame.columnconfigure(0, weight=1)
+        output_group, output_layout = self._make_group("输出", QHBoxLayout)
+        self.output_path_input = QLineEdit()
+        output_layout.addWidget(self.output_path_input, stretch=1)
+        self.output_button = QPushButton("选择输出目录")
+        self.output_button.clicked.connect(self._choose_output)
+        output_layout.addWidget(self.output_button)
+        root_layout.addWidget(output_group)
 
-        self.output_path_var = tk.StringVar()
-        output_entry = ttk.Entry(output_frame, textvariable=self.output_path_var)
-        output_entry.grid(row=0, column=0, sticky=tk.EW)
+        action_group, action_layout = self._make_group("操作", QVBoxLayout)
+        top_row = QHBoxLayout()
+        self.start_button = QPushButton("一键启动转录")
+        self.start_button.clicked.connect(self._start)
+        self.start_button.setMinimumHeight(38)
+        top_row.addWidget(self.start_button)
 
-        output_btn = ttk.Button(output_frame, text="选择输出目录", command=self._choose_output)
-        output_btn.grid(row=0, column=1, padx=(8, 0))
+        self.save_button = QPushButton("保存默认设置")
+        self.save_button.clicked.connect(self._save_settings)
+        self.save_button.setMinimumHeight(38)
+        top_row.addWidget(self.save_button)
+        top_row.addStretch(1)
 
-        action_frame = ttk.LabelFrame(main, text="操作", padding=10)
-        action_frame.pack(fill=tk.X, pady=(10, 0))
-        action_frame.columnconfigure(1, weight=1)
+        self.status_label = QLabel("准备就绪")
+        self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        top_row.addWidget(self.status_label)
+        action_layout.addLayout(top_row)
 
-        button_group = ttk.Frame(action_frame)
-        button_group.grid(row=0, column=0, sticky=tk.W)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        action_layout.addWidget(self.progress)
+        root_layout.addWidget(action_group)
 
-        self.start_button = ttk.Button(
-            button_group,
-            text="一键启动转录",
-            command=self._start,
-            style="Action.TButton",
-        )
-        self.start_button.pack(side=tk.LEFT)
+        log_group, log_layout = self._make_group("日志", QVBoxLayout)
+        self.log_text = QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        log_layout.addWidget(self.log_text)
+        root_layout.addWidget(log_group, stretch=1)
 
-        save_btn = ttk.Button(
-            button_group,
-            text="保存默认设置",
-            command=self._save_settings,
-            style="Action.TButton",
-        )
-        save_btn.pack(side=tk.LEFT, padx=(8, 0))
-
-        self.status_var = tk.StringVar(value="准备就绪")
-        status_label = ttk.Label(action_frame, textvariable=self.status_var, foreground="#555")
-        status_label.grid(row=0, column=1, sticky=tk.E, padx=(12, 0))
-
-        self.progress = ttk.Progressbar(action_frame, mode="indeterminate")
-        self.progress.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
-
-        log_frame = ttk.LabelFrame(main, text="日志", padding=12)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
-
-        self.log_text = tk.Text(log_frame, height=14)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-
-        self._log("应用启动完成。")
-        if not DND_AVAILABLE:
-            self._log("提示: 未安装 tkinterdnd2，拖放功能不可用。")
-
-    def _add_row(
-        self,
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        variable: Optional[tk.StringVar] = None,
-        show: Optional[str] = None,
-        hint: Optional[str] = None,
-        widget: Optional[tk.Widget] = None,
-    ) -> None:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, padx=(0, 8), pady=4)
-        if widget is None:
-            entry = ttk.Entry(parent, textvariable=variable, show=show)
-            entry.grid(row=row, column=1, sticky=tk.EW, pady=4)
-            widget = entry
-        else:
-            widget.grid(row=row, column=1, sticky=tk.W, pady=4)
-
-        if hint:
-            ttk.Label(parent, text=hint, foreground="#666").grid(
-                row=row, column=2, sticky=tk.W, padx=(8, 0), pady=4
-            )
-
-        parent.columnconfigure(1, weight=1)
-
-    def _enable_drop(self) -> None:
-        if not DND_AVAILABLE:
-            return
-
-        def handle_drop(event: tk.Event) -> None:
-            dropped = self.root.tk.splitlist(event.data)
-            self._add_audio_files(dropped)
-
-        self.root.drop_target_register(DND_FILES)
-        self.root.dnd_bind("<<Drop>>", handle_drop)
+    def _make_group(self, title: str, body_layout_cls=QVBoxLayout):
+        group = QFrame()
+        group.setFrameShape(QFrame.StyledPanel)
+        group.setObjectName("groupBox")
+        wrapper = QVBoxLayout(group)
+        wrapper.setContentsMargins(12, 16, 12, 12)
+        wrapper.setSpacing(10)
+        header = QLabel(title)
+        header.setStyleSheet("font-weight: 600; font-size: 14px;")
+        wrapper.addWidget(header)
+        body_layout = body_layout_cls()
+        wrapper.addLayout(body_layout)
+        return group, body_layout
 
     def _choose_files(self) -> None:
-        filetypes = [
-            ("音频文件", "*.mp3 *.wav *.m4a *.flac *.ogg *.opus *.aac *.wma *.amr *.webm *.mp4 *.mpeg *.mpga"),
-            ("所有文件", "*.*"),
-        ]
-        paths = filedialog.askopenfilenames(title="选择音频文件", filetypes=filetypes)
+        file_filter = (
+            "音频文件 (*.mp3 *.wav *.m4a *.flac *.ogg *.opus *.aac *.wma *.amr *.webm *.mp4 *.mpeg *.mpga);;所有文件 (*.*)"
+        )
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择音频文件", "", file_filter)
         if paths:
             self._add_audio_files(paths)
 
-    def _add_audio_files(self, paths) -> None:
-        existing = set(self.audio_listbox.get(0, tk.END))
-        added_count = 0
+    def _add_audio_files(self, paths: List[str]) -> None:
+        existing = set(self._get_audio_files())
         for path in paths:
-            normalized = path.strip("{}")
-            if not os.path.isfile(normalized):
+            normalized = path.strip().strip("{}")
+            if not normalized or not os.path.isfile(normalized):
                 continue
             if not self._is_supported_audio_file(normalized):
                 self._log(f"已忽略不支持的格式: {normalized}")
                 continue
             if normalized in existing:
                 continue
-            self.audio_listbox.insert(tk.END, normalized)
+            self.audio_list.addItem(QListWidgetItem(normalized))
             existing.add(normalized)
-            added_count += 1
             self._log(f"已添加文件: {normalized}")
 
     def _remove_selected_files(self) -> None:
-        selected = list(self.audio_listbox.curselection())
-        for index in reversed(selected):
-            self.audio_listbox.delete(index)
+        selected = self.audio_list.selectedItems()
+        for item in selected:
+            row = self.audio_list.row(item)
+            self.audio_list.takeItem(row)
         if selected:
             self._log(f"已移除 {len(selected)} 个文件。")
 
     def _clear_audio_files(self) -> None:
-        count = self.audio_listbox.size()
+        count = self.audio_list.count()
         if count == 0:
             return
-        self.audio_listbox.delete(0, tk.END)
+        self.audio_list.clear()
         self._log("已清空文件队列。")
 
     def _get_audio_files(self) -> List[str]:
-        return list(self.audio_listbox.get(0, tk.END))
+        return [self.audio_list.item(index).text() for index in range(self.audio_list.count())]
 
     def _is_supported_audio_file(self, path: str) -> bool:
-        ext = os.path.splitext(path)[1].lower()
-        return ext in SUPPORTED_AUDIO_EXTENSIONS
+        return Path(path).suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
 
     def _choose_output(self) -> None:
-        path = filedialog.askdirectory(title="选择输出目录")
+        path = QFileDialog.getExistingDirectory(self, "选择输出目录")
         if path:
-            self.output_path_var.set(path)
+            self.output_path_input.setText(path)
             self._log(f"输出目录: {path}")
 
     def _settings_snapshot(self) -> dict:
         return {
-            "api_key": self.api_key_var.get().strip(),
-            "api_url": self.api_url_var.get().strip(),
-            "model": self.model_var.get().strip(),
-            "chunk_level": self.chunk_level_var.get().strip(),
-            "output_dir": self.output_path_var.get().strip(),
+            "api_key": self.api_key_input.text().strip(),
+            "api_url": self.api_url_input.text().strip(),
+            "model": self.model_combo.currentText().strip(),
+            "chunk_level": self.chunk_level_combo.currentText().strip(),
+            "output_dir": self.output_path_input.text().strip(),
         }
 
     def _apply_settings(self, settings: dict) -> None:
-        self.api_key_var.set(settings.get("api_key", self.api_key_var.get()))
-        self.api_url_var.set(settings.get("api_url", self.api_url_var.get()))
-        self.model_var.set(settings.get("model", self.model_var.get()))
-        self.chunk_level_var.set(settings.get("chunk_level", self.chunk_level_var.get()))
-        self.output_path_var.set(settings.get("output_dir", self.output_path_var.get()))
+        self.api_key_input.setText(settings.get("api_key", self.api_key_input.text()))
+        self.api_url_input.setText(settings.get("api_url", self.api_url_input.text()))
+        self.model_combo.setCurrentText(settings.get("model", self.model_combo.currentText()))
+        self.chunk_level_combo.setCurrentText(settings.get("chunk_level", self.chunk_level_combo.currentText()))
+        self.output_path_input.setText(settings.get("output_dir", self.output_path_input.text()))
 
     def _load_settings(self) -> None:
         if not os.path.isfile(SETTINGS_PATH):
@@ -310,114 +362,96 @@ class TranscriptionApp:
                 json.dump(settings, settings_file, ensure_ascii=False, indent=2)
             self._log("已保存默认设置。")
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("保存失败", f"无法保存默认设置: {exc}")
+            QMessageBox.critical(self, "保存失败", f"无法保存默认设置: {exc}")
+
+    def _set_running_state(self, is_running: bool) -> None:
+        self.start_button.setEnabled(not is_running)
+        self.add_file_button.setEnabled(not is_running)
+        self.remove_button.setEnabled(not is_running)
+        self.clear_button.setEnabled(not is_running)
+        if is_running:
+            self.progress.setRange(0, 0)
+            self.status_label.setText("正在转录...")
+        else:
+            self.progress.setRange(0, 1)
+            self.progress.setValue(0)
+            self.status_label.setText("准备就绪")
 
     def _start(self) -> None:
-        if self.start_button["state"] == tk.DISABLED:
-            return
-
         audio_files = self._get_audio_files()
         if not audio_files:
-            messagebox.showwarning("缺少文件", "请先添加至少一个音频文件。")
+            QMessageBox.warning(self, "缺少文件", "请先添加至少一个音频文件。")
             return
 
         options = self._collect_options()
         if not options:
             return
 
-        self.start_button.config(state=tk.DISABLED)
-        self.status_var.set("正在转录...")
-        self.progress.start(10)
+        self._set_running_state(True)
         self._log("开始转录...")
-
-        thread = threading.Thread(
-            target=self._run_transcription,
-            args=(options, audio_files),
-            daemon=True,
-        )
-        thread.start()
+        worker = BatchTranscriptionWorker(self, options, audio_files)
+        worker.signals.log.connect(self._log)
+        worker.signals.status.connect(self.status_label.setText)
+        worker.signals.error.connect(self._handle_worker_error)
+        worker.signals.finished.connect(self._handle_worker_finished)
+        self.thread_pool.start(worker)
+        self._worker = worker
 
     def _collect_options(self) -> Optional[TranscriptionOptions]:
-        api_key = self.api_key_var.get().strip()
-        api_url = self.api_url_var.get().strip()
-        model = self.model_var.get().strip()
-        chunk_level = self.chunk_level_var.get().strip()
+        api_key = self.api_key_input.text().strip()
+        api_url = self.api_url_input.text().strip()
+        model = self.model_combo.currentText().strip()
+        chunk_level = self.chunk_level_combo.currentText().strip() or "segment"
+        output_dir = self.output_path_input.text().strip()
 
         if not api_key:
-            messagebox.showwarning("缺少 API Key", "请输入 API Key。")
+            QMessageBox.warning(self, "缺少 API Key", "请输入 API Key。")
             return None
         if not api_url:
-            messagebox.showwarning("缺少 API 地址", "请输入 API 地址。")
+            QMessageBox.warning(self, "缺少 API 地址", "请输入 API 地址。")
             return None
         if not model:
-            messagebox.showwarning("缺少模型", "请输入或选择模型名称。")
+            QMessageBox.warning(self, "缺少模型", "请输入或选择模型名称。")
             return None
 
         return TranscriptionOptions(
             api_key=api_key,
             api_url=api_url,
             model=model,
-            chunk_level=chunk_level or "segment",
+            chunk_level=chunk_level,
+            output_dir=output_dir,
         )
 
-    def _run_transcription(self, options: TranscriptionOptions, audio_files: List[str]) -> None:
-        try:
-            output_paths = [""] * len(audio_files)
-            total = len(audio_files)
-            self._log(f"已启用批量模式，并行任务数: {DEFAULT_BATCH_PARALLEL_JOBS}")
+    def _handle_worker_finished(self, output_paths: List[str]) -> None:
+        self._set_running_state(False)
+        summary = "\n".join(output_paths)
+        QMessageBox.information(self, "完成", f"批量转录完成，共 {len(output_paths)} 个文件:\n{summary}")
 
-            with ThreadPoolExecutor(max_workers=DEFAULT_BATCH_PARALLEL_JOBS) as executor:
-                future_map = {}
-                for index, audio_path in enumerate(audio_files, start=1):
-                    self._log(f"[{index}/{total}] 已加入批处理队列: {audio_path}")
-                    future = executor.submit(self._transcribe, options, audio_path)
-                    future_map[future] = index - 1
+    def _handle_worker_error(self, message: str) -> None:
+        self._log(f"错误: {message}")
+        self._set_running_state(False)
+        QMessageBox.critical(self, "错误", message)
 
-                completed = 0
-                for future in as_completed(future_map):
-                    output_path = future.result()
-                    item_index = future_map[future]
-                    output_paths[item_index] = output_path
-                    completed += 1
-                    self._log(f"[{completed}/{total}] 完成: {output_path}")
-
-            summary = "\n".join(output_paths)
-            messagebox.showinfo("完成", f"批量转录完成，共 {len(output_paths)} 个文件:\n{summary}")
-        except Exception as exc:  # noqa: BLE001
-            self._log(f"错误: {exc}")
-            messagebox.showerror("错误", str(exc))
-        finally:
-            self.progress.stop()
-            self.start_button.config(state=tk.NORMAL)
-            self.status_var.set("准备就绪")
-
-    def _transcribe(self, options: TranscriptionOptions, audio_path: str) -> str:
-        output_dir = self.output_path_var.get() or os.path.dirname(audio_path)
+    def _transcribe(self, options: TranscriptionOptions, audio_path: str, signals: WorkerSignals) -> str:
+        output_dir = options.output_dir or os.path.dirname(audio_path)
         os.makedirs(output_dir, exist_ok=True)
 
         headers = {"Authorization": f"Bearer {options.api_key}"}
 
         model_name = self._normalize_model(options.model)
         if model_name != options.model:
-            self._log(f"模型已自动补全为: {model_name}")
+            signals.log.emit(f"模型已自动补全为: {model_name}")
 
-        data = {
-            "task": "transcribe",
-            "chunk_level": options.chunk_level,
-        }
-
-        payload = {key: value for key, value in data.items() if value is not None}
-
+        payload = {"task": "transcribe", "chunk_level": options.chunk_level}
         filename = os.path.splitext(os.path.basename(audio_path))[0]
         output_path = os.path.join(output_dir, f"{filename}.srt")
-
         api_url = self._build_api_url(options.api_url, model_name)
 
         for attempt in range(options.max_retries + 1):
             try:
                 with open(audio_path, "rb") as audio_file:
                     files = {"audio": (os.path.basename(audio_path), audio_file)}
-                    self._log("正在请求 API...")
+                    signals.log.emit(f"正在请求 API: {audio_path}")
                     response = requests.post(
                         api_url,
                         headers=headers,
@@ -429,7 +463,7 @@ class TranscriptionApp:
                     raise RuntimeError(self._format_api_error(response))
 
                 result = self._extract_transcription_result(
-                    self._resolve_async_response(api_url, headers, response.json(), options)
+                    self._resolve_async_response(api_url, headers, response.json(), options, signals)
                 )
                 srt = self._build_srt(
                     result,
@@ -445,7 +479,7 @@ class TranscriptionApp:
                 if attempt >= options.max_retries:
                     raise exc
                 wait_time = 2 ** attempt
-                self._log(f"请求失败，{wait_time} 秒后重试: {exc}")
+                signals.log.emit(f"请求失败，{wait_time} 秒后重试: {exc}")
                 time.sleep(wait_time)
 
         raise RuntimeError("无法完成转录，请检查网络或 API Key。")
@@ -462,12 +496,7 @@ class TranscriptionApp:
             words = result.get("words", [])
             if words:
                 return self._build_srt_from_words(words)
-        return self._build_srt_from_segments(
-            result.get("segments", []),
-            max_chars,
-            max_duration,
-            max_silence,
-        )
+        return self._build_srt_from_segments(result.get("segments", []), max_chars, max_duration, max_silence)
 
     def _extract_transcription_result(self, payload: dict) -> dict:
         if not isinstance(payload, dict):
@@ -475,10 +504,8 @@ class TranscriptionApp:
         output = payload.get("output")
         if isinstance(output, dict):
             return output
-        if isinstance(output, list) and output:
-            first = output[0]
-            if isinstance(first, dict):
-                return first
+        if isinstance(output, list) and output and isinstance(output[0], dict):
+            return output[0]
         return payload
 
     def _resolve_async_response(
@@ -487,6 +514,7 @@ class TranscriptionApp:
         headers: dict,
         payload: dict,
         options: TranscriptionOptions,
+        signals: WorkerSignals,
     ) -> dict:
         if not isinstance(payload, dict):
             return payload
@@ -504,7 +532,7 @@ class TranscriptionApp:
 
         deadline = time.time() + ASYNC_POLL_TIMEOUT_SECONDS
         while time.time() < deadline:
-            self._log(f"任务状态: {status or 'unknown'}，{ASYNC_POLL_INTERVAL_SECONDS} 秒后轮询...")
+            signals.log.emit(f"任务状态: {status or 'unknown'}，{ASYNC_POLL_INTERVAL_SECONDS} 秒后轮询...")
             time.sleep(ASYNC_POLL_INTERVAL_SECONDS)
             poll_resp = requests.get(status_url, headers=headers, timeout=options.timeout_seconds)
             if poll_resp.status_code >= 400:
@@ -522,15 +550,17 @@ class TranscriptionApp:
 
     def _build_srt_from_words(self, words_data: List[dict]) -> str:
         srt_lines = []
-        for idx, word in enumerate(words_data, start=1):
+        line_number = 0
+        for word in words_data:
             text = (word.get("word") or "").strip()
             if not text:
                 continue
+            line_number += 1
             start = float(word.get("start", 0.0))
             end = float(word.get("end", start))
             srt_lines.extend(
                 [
-                    str(idx),
+                    str(line_number),
                     f"{self._format_timestamp(start)} --> {self._format_timestamp(end)}",
                     text,
                     "",
@@ -550,17 +580,10 @@ class TranscriptionApp:
             text = (segment.get("text") or "").strip()
             if not text:
                 continue
-            segments.append(
-                Segment(
-                    start=float(segment.get("start", 0.0)),
-                    end=float(segment.get("end", 0.0)),
-                    text=text,
-                )
-            )
+            segments.append(Segment(start=float(segment.get("start", 0.0)), end=float(segment.get("end", 0.0)), text=text))
 
         merged: List[Segment] = []
         current: Optional[Segment] = None
-
         for seg in segments:
             if current is None:
                 current = Segment(seg.start, seg.end, seg.text)
@@ -569,12 +592,7 @@ class TranscriptionApp:
             gap = seg.start - current.end
             combined_text = f"{current.text} {seg.text}".strip()
             duration = seg.end - current.start
-
-            if (
-                len(combined_text) <= max_chars
-                and duration <= max_duration
-                and gap <= max_silence
-            ):
+            if len(combined_text) <= max_chars and duration <= max_duration and gap <= max_silence:
                 current.end = seg.end
                 current.text = combined_text
             else:
@@ -590,14 +608,7 @@ class TranscriptionApp:
 
         srt_lines = []
         for idx, seg in enumerate(refined, start=1):
-            srt_lines.extend(
-                [
-                    str(idx),
-                    f"{self._format_timestamp(seg.start)} --> {self._format_timestamp(seg.end)}",
-                    seg.text,
-                    "",
-                ]
-            )
+            srt_lines.extend([str(idx), f"{self._format_timestamp(seg.start)} --> {self._format_timestamp(seg.end)}", seg.text, ""])
         return "\n".join(srt_lines).strip() + ("\n" if srt_lines else "")
 
     def _split_segment(self, segment: Segment, max_chars: int, max_duration: float) -> List[Segment]:
@@ -608,12 +619,7 @@ class TranscriptionApp:
         if max_chars <= 0:
             chunks = [text]
         else:
-            chunks = textwrap.wrap(
-                text,
-                width=max_chars,
-                break_long_words=True,
-                break_on_hyphens=False,
-            )
+            chunks = textwrap.wrap(text, width=max_chars, break_long_words=True, break_on_hyphens=False)
 
         total_duration = max(segment.end - segment.start, 0.0)
         if max_duration > 0 and total_duration > 0:
@@ -622,12 +628,7 @@ class TranscriptionApp:
                 target_width = max(1, math.ceil(len(text) / required_count))
                 if max_chars > 0:
                     target_width = min(max_chars, target_width)
-                chunks = textwrap.wrap(
-                    text,
-                    width=target_width,
-                    break_long_words=True,
-                    break_on_hyphens=False,
-                )
+                chunks = textwrap.wrap(text, width=target_width, break_long_words=True, break_on_hyphens=False)
             if len(chunks) < required_count:
                 chunks = self._ensure_chunk_count(chunks, required_count)
 
@@ -645,7 +646,7 @@ class TranscriptionApp:
         return refined
 
     def _ensure_chunk_count(self, chunks: List[str], target_count: int) -> List[str]:
-        normalized = [chunk.strip() for chunk in chunks if chunk.strip()]
+        normalized = [chunk.strip() for chunk in chunks if chunk.strip()] or [""]
         while len(normalized) < target_count:
             longest_index = max(range(len(normalized)), key=lambda i: len(normalized[i]))
             text = normalized[longest_index]
@@ -659,24 +660,21 @@ class TranscriptionApp:
                 first, second = text[:mid], text[mid:]
             else:
                 first, second = text[:split_index], text[split_index + 1 :]
-            normalized[longest_index : longest_index + 1] = [
-                part.strip() for part in (first, second) if part.strip()
-            ]
-        return normalized
+            replacements = [part.strip() for part in (first, second) if part.strip()]
+            if not replacements:
+                break
+            normalized[longest_index : longest_index + 1] = replacements
+        return [chunk for chunk in normalized if chunk]
 
     def _format_api_error(self, response: requests.Response) -> str:
         status = response.status_code
         body = response.text.strip()
         if status == 402:
-            return (
-                "API 返回错误 402: 账户余额不足，请在 DeepInfra 控制台充值或配置自动续费。"
-            )
+            return "API 返回错误 402: 账户余额不足，请在 DeepInfra 控制台充值或配置自动续费。"
         if status == 401:
             return "API 返回错误 401: API Key 无效或缺失。"
         if status == 404:
-            return (
-                "API 返回错误 404: 模型不存在，请确认模型名称（如 openai/whisper-large-v3）。"
-            )
+            return "API 返回错误 404: 模型不存在，请确认模型名称（如 openai/whisper-large-v3）。"
         return f"API 返回错误 {status}: {body}"
 
     def _normalize_model(self, model: str) -> str:
@@ -699,7 +697,6 @@ class TranscriptionApp:
         base = api_url.strip().rstrip("/")
         if not base:
             return API_URL
-
         normalized_model = self._normalize_model(model)
         if base.endswith(normalized_model):
             return base
@@ -711,18 +708,17 @@ class TranscriptionApp:
         return base
 
     def _log(self, message: str) -> None:
-        if threading.current_thread() is not threading.main_thread():
-            self.root.after(0, self._log, message)
-            return
         timestamp = time.strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.see(tk.END)
+        self.log_text.appendPlainText(f"[{timestamp}] {message}")
 
 
 def main() -> None:
-    root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
-    app = TranscriptionApp(root)
-    root.mainloop()
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName("deepinfra-transcriber")
+    qdarktheme.setup_theme("auto")
+    window = TranscriptionApp()
+    window.show()
+    app.exec()
 
 
 if __name__ == "__main__":
